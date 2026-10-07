@@ -5,6 +5,11 @@
 # ± points of the weekly meter that still count as "on plan"
 tolerance = 2
 
+# The hour a "day" rolls over (default 0, midnight). With 2, Tuesday runs
+# Tue 2am -> Wed 2am, so a late night counts toward the evening it began in,
+# and a block may run past midnight: [18, 2, 0.8].
+# day_starts = 2
+
 # Share of the week each day gets. Only the ratios matter.
 # Keys: mon tue wed thu fri sat sun, or the groups weekday / weekend / all.
 # A named day beats a group, a group beats `all`. 0 means a day off.

@@ -6,14 +6,16 @@ Am I over or under on Claude Code this week — and what should I do about it to
 Claude Code  Tue 5:58 PM  · week resets Sat 12:00 AM (3d 6h)
 
   weekly   ████████████████████░░░░░░░░░░░░░░░░░░░░  51%  [UNDER by 3.4%]  on pace   over
-                                 ▲ plan 54%
+                                 ▲ expected by now: 54%
   today    █████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  4 of 17%  · 13% left to tonight's 64%
-                                        ▲ plan
+                                        ▲ expected by now
   session  ██░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  5%  · 5h window resets 6:40 PM (42m)
 
   Quiet so far — you can go 1.4x tonight (13% vs the usual 10%).
 
-  bedtime  Sat 20 · Sun 40 · Mon 52 · [Tue 64] · Wed 76 · Thu 88 · Fri 100
+           Sat  Sun  Mon  Tue  Wed  Thu  Fri
+  target    20   40   52   64   76   88  100
+  actual    18   41   47   51    ·    ·    ·
 ```
 
 The weekly meter only means something next to where it *should* be by now.
@@ -57,6 +59,19 @@ weekend = [[9, 24, 1.0]]
 
 Keys are `mon`…`sun` or the groups `weekday` / `weekend` / `all`. The last
 block of a day is the "prime" block the advice is phrased around.
+
+If you work past midnight, set `day_starts` so a late night counts toward the
+evening it began in, and let a block run past midnight:
+
+```toml
+day_starts = 2         # Tuesday runs Tue 2am -> Wed 2am
+
+[hours]
+weekday = [[2, 8, 0.10], [8, 18, 0.15], [18, 2, 0.75]]
+```
+
+The table at the bottom shows where the meter should close each day and where
+it actually did (`?` when no reading was logged that day).
 
 ## The today bar
 

@@ -48,12 +48,44 @@ SHAPE = dict.fromkeys(range(7), [(9, 24, 1.0)])
 
 TOLERANCE = 2.0  # ± points of the weekly meter that still count as "on plan"
 
+# The hour a "day" rolls over. With 2, Tuesday runs Tue 2am → Wed 2am, so a
+# late night still counts toward the evening it began in, and a block may run
+# past midnight ([18, 2]).
+DAY_STARTS = 0.0
+
+
+def anchor(t: datetime) -> datetime:
+    """Calendar midnight of the plan-day `t` falls in; that day spans
+    anchor + DAY_STARTS hours → anchor + DAY_STARTS + 24 hours."""
+    return (t - timedelta(hours=DAY_STARTS)).replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def fit(blocks) -> list[tuple[float, float, float]] | None:
+    """Clock-hour blocks → hours since the anchor, in day order, fractions
+    normalised. Hours before DAY_STARTS belong to the tail of the day, so
+    [18, 2] becomes 18 → 26. None if they don't make a valid day."""
+    try:
+        out = []
+        for a, b, f in blocks:
+            a, b, f = float(a), float(b), float(f)
+            a, b = (a if a >= DAY_STARTS else a + 24), (b if b > DAY_STARTS else b + 24)
+            if not (0 <= a < b <= DAY_STARTS + 24 and f >= 0):
+                return None
+            out.append((a, b, f))
+    except (TypeError, ValueError):
+        return None
+    out.sort()
+    whole = sum(f for *_, f in out)
+    if not out or whole <= 0 or any(p[1] > n[0] for p, n in zip(out, out[1:])):
+        return None
+    return [(a, b, f / whole) for a, b, f in out]
+
 CONFIG = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "ccpace" / "config.toml"
 
 
 def load_config(path: Path) -> None:
     """Overlay config.toml on the defaults above. A missing file is fine."""
-    global TOLERANCE
+    global TOLERANCE, DAY_STARTS
     try:
         cfg = tomllib.loads(path.read_text())
     except FileNotFoundError:
@@ -83,17 +115,16 @@ def load_config(path: Path) -> None:
     if not any(DAY_WEIGHT.values()):
         bad("[days] can't all be zero")
 
+    DAY_STARTS = cfg.get("day_starts", DAY_STARTS)
+    if not isinstance(DAY_STARTS, (int, float)) or not 0 <= DAY_STARTS < 24:
+        bad("day_starts must be an hour from 0 up to 24")
+    for i in range(7):  # re-seat the defaults on the new day boundary
+        SHAPE[i] = fit(SHAPE[i]) or [(DAY_STARTS, DAY_STARTS + 24, 1.0)]
+
     for i, key, blocks in expand("hours"):
-        try:
-            blocks = sorted((float(a), float(b), float(f)) for a, b, f in blocks)
-            ok = blocks and all(0 <= a < b <= 24 and f >= 0 for a, b, f in blocks) \
-                and all(p[1] <= n[0] for p, n in zip(blocks, blocks[1:])) and sum(f for *_, f in blocks) > 0
-        except (TypeError, ValueError):
-            ok = False
-        if not ok:
-            bad(f"hours.{key} must be non-overlapping [from_hour, to_hour, fraction] blocks within 0-24")
-        whole = sum(f for *_, f in blocks)
-        SHAPE[i] = [(a, b, f / whole) for a, b, f in blocks]
+        SHAPE[i] = fit(blocks) or bad(
+            f"hours.{key} must be non-overlapping [from_hour, to_hour, fraction] blocks "
+            f"inside one day ({DAY_STARTS:g}:00 to {DAY_STARTS:g}:00)")
 
     TOLERANCE = float(cfg.get("tolerance", TOLERANCE))
 
@@ -175,9 +206,9 @@ class Plan:
     def __init__(self, start: datetime, reset: datetime):
         self.start, self.reset = start, reset
         self.segs: list[tuple[datetime, datetime, float]] = []
-        day = start.replace(hour=0, minute=0)
-        while day < reset:
-            for h0, h1, frac in self.shape(day):
+        day = anchor(start)
+        while day + timedelta(hours=DAY_STARTS) < reset:
+            for h0, h1, frac in SHAPE[day.weekday()]:
                 a, b = day + timedelta(hours=h0), day + timedelta(hours=h1)
                 lo, hi = max(a, start), min(b, reset)
                 if hi > lo:  # clip to the window, keeping a proportional share
@@ -187,7 +218,7 @@ class Plan:
 
     @staticmethod
     def shape(day: datetime):
-        return SHAPE[day.weekday()]
+        return SHAPE[anchor(day).weekday()]
 
     def at(self, t: datetime) -> float:
         done = 0.0
@@ -216,6 +247,33 @@ def record(used: float, t: float) -> None:
         pass
 
 
+def readings(plan: Plan, now: datetime) -> list[tuple[datetime, float]]:
+    """Logged readings from this window, oldest first, up to now."""
+    out = []
+    try:
+        for line in HISTORY.read_text().splitlines():
+            s = json.loads(line)
+            t = datetime.fromtimestamp(s["t"])
+            if plan.start <= t <= now + timedelta(minutes=1):  # incl. the one just taken
+                out.append((t, float(s["used"])))
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return sorted(out)
+
+
+def closing(log: list[tuple[datetime, float]], begins: datetime, ends: datetime) -> float | None:
+    """What the meter read when a past day ended, if the log can say: the last
+    reading taken that day, or a reading either side of it that agrees."""
+    during = [v for t, v in log if begins <= t < ends]
+    if during:
+        return during[-1]
+    before = [v for t, v in log if t < begins]
+    after = [v for t, v in log if t >= ends]
+    if before and after and before[-1] == after[0]:
+        return after[0]
+    return None
+
+
 def day_start(now: datetime, plan: Plan) -> tuple[float | None, str]:
     """What the weekly meter read when today began, and how far to trust it.
 
@@ -224,20 +282,15 @@ def day_start(now: datetime, plan: Plan) -> tuple[float | None, str]:
     none, the first reading of today is used, which misses whatever came
     before it. (None, ...) means there is nothing to go on.
     """
-    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    midnight = anchor(now) + timedelta(hours=DAY_STARTS)  # when today began
     if midnight <= plan.start:
         return 0.0, ""  # first day of the window: the meter started at zero
     before = after = None
-    try:
-        for line in HISTORY.read_text().splitlines():
-            s = json.loads(line)
-            t = datetime.fromtimestamp(s["t"])
-            if plan.start <= t < midnight:
-                before = (t, float(s["used"]))
-            elif midnight <= t <= now + timedelta(minutes=1) and after is None:  # incl. the one just taken
-                after = (t, float(s["used"]))
-    except (OSError, ValueError, KeyError, TypeError):
-        pass
+    for t, v in readings(plan, now):
+        if t < midnight:
+            before = (t, v)
+        elif after is None:
+            after = (t, v)
     if before:
         t, v = before
         settled = midnight - t <= timedelta(hours=1) or (after and after[1] == v)
@@ -250,12 +303,12 @@ def day_start(now: datetime, plan: Plan) -> tuple[float | None, str]:
 
 # ── advice ───────────────────────────────────────────────────────────────────
 def analyse(used: float, now: datetime, plan: Plan, start: float | None = None, start_note: str = "") -> dict:
-    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    midnight = anchor(now) + timedelta(hours=DAY_STARTS)  # when today began
     if start is None:
         start = plan.at(midnight)
     start = min(start, used)  # the meter only climbs within a window
     eod = min(midnight + timedelta(days=1), plan.reset)
-    prime_from = midnight + timedelta(hours=Plan.shape(now)[-1][0])
+    prime_from = anchor(now) + timedelta(hours=Plan.shape(now)[-1][0])
     evening = Plan.shape(now)[-1][0] >= 15  # is the prime block an evening one?
 
     expected = plan.at(now)
@@ -366,7 +419,7 @@ def render(a: dict, now: datetime, plan: Plan, session: dict | None, notes: list
         (c(lit[s], f" {label} ") if COLOR else f"[{label}]") if s == state else dim(f" {s} ")
         for s in lit)
     print(f"  weekly   {tone('█' * fill)}{dim('░' * (W - fill))}  {bold(f'{used:.0f}%')}  {verdict}")
-    print(f"           {' ' * mark}{dim('▲ plan ' + f'{exp:.0f}%')}")
+    print(f"           {' ' * mark}{dim(f'▲ expected by now: {exp:.0f}%')}")
 
     # today: used since the day began, out of what it takes to reach the
     # bedtime target from there (so a day started under plan gets more)
@@ -383,7 +436,7 @@ def render(a: dict, now: datetime, plan: Plan, session: dict | None, notes: list
         else:
             extra = f"{a['room_today']:.0f}% left to {block}'s {a['bedtime_target']:.0f}%"
         print(f"  today    {tone('█' * fill)}{dim('░' * (W - fill))}  {bold(label)}  {dim('· ')}{extra}{note}")
-        print(f"           {' ' * mark}{dim('▲ plan')}")
+        print(f"           {' ' * mark}{dim('▲ expected by now')}")
     else:
         why = f"started the day at {a['day_start']:.0f}%, already at the bedtime target"
         print(f"  today    {red('█' * W) if spent > 0.5 else dim('░' * W)}  {bold(f'{spent:.0f}% used')}  {dim('· ' + why)}{note}")
@@ -402,13 +455,25 @@ def render(a: dict, now: datetime, plan: Plan, session: dict | None, notes: list
         print(f"  {line}")
     print()
 
-    # bedtime readings for the week, today highlighted
-    cells, day = [], plan.start.replace(hour=0, minute=0)
-    while day < plan.reset:
-        cell = f"{day:%a} {plan.at(min(day + timedelta(days=1), plan.reset)):.0f}"
-        cells.append(bold(f"[{cell}]") if day.date() == now.date() else dim(cell))
+    # the week as a table: where the meter should close each day, and where it did
+    log, rows, day = readings(plan, now), [[], [], []], anchor(plan.start)
+    while (begins := day + timedelta(hours=DAY_STARTS)) < plan.reset:
+        begins, ends = max(begins, plan.start), min(begins + timedelta(days=1), plan.reset)
+        today = day == anchor(now)
+        if today or ends - begins >= timedelta(hours=6):  # skip the sliver a reset leaves behind
+            if today:
+                actual = f"{used:.0f}"
+            elif ends <= now:
+                v = closing(log, begins, ends)
+                actual = "?" if v is None else f"{v:.0f}"
+            else:
+                actual = "·"
+            style = bold if today else dim
+            for row, text in zip(rows, (f"{day:%a}", f"{plan.at(ends):.0f}", actual)):
+                row.append(style(f"{text:>5}"))
         day += timedelta(days=1)
-    print(f"  {dim('bedtime')}  {dim(' · ').join(cells)}")
+    for name, row in zip(("", "target", "actual"), rows):
+        print(f"  {dim(f'{name:<7}')}{''.join(row)}")
     for n in notes:
         print(dim(f"  ! {n}"))
 
