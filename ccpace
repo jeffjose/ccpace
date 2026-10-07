@@ -158,6 +158,7 @@ def fetch_usage(force: bool) -> tuple[dict, float, str | None]:
         CACHE.write_text(json.dumps({"fetched_at": now, "data": data}))
     except OSError:
         pass
+    record((data.get("seven_day") or {}).get("utilization") or 0.0, now)
     return data, now, None
 
 
@@ -198,9 +199,61 @@ class Plan:
         return 100.0 * done / self.total
 
 
-# ── advice ───────────────────────────────────────────────────────────────────
-def analyse(used: float, now: datetime, plan: Plan) -> dict:
+# ── history ──────────────────────────────────────────────────────────────────
+# Every live reading is appended here so "today" can be measured from what the
+# meter actually said when the day began, rather than from the plan.
+HISTORY = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state") / "ccpace" / "history.jsonl"
+
+
+def record(used: float, t: float) -> None:
+    try:
+        HISTORY.parent.mkdir(parents=True, exist_ok=True)
+        if HISTORY.exists() and HISTORY.stat().st_size > 256_000:  # a week is all that's ever read
+            HISTORY.write_text("".join(HISTORY.read_text().splitlines(keepends=True)[-2000:]))
+        with HISTORY.open("a") as f:
+            f.write(json.dumps({"t": round(t), "used": used}) + "\n")
+    except OSError:
+        pass
+
+
+def day_start(now: datetime, plan: Plan) -> tuple[float | None, str]:
+    """What the weekly meter read when today began, and how far to trust it.
+
+    Returns (reading, caveat). The last reading before midnight is a floor
+    (anything used after it and before midnight gets counted as today); with
+    none, the first reading of today is used, which misses whatever came
+    before it. (None, ...) means there is nothing to go on.
+    """
     midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    if midnight <= plan.start:
+        return 0.0, ""  # first day of the window: the meter started at zero
+    before = after = None
+    try:
+        for line in HISTORY.read_text().splitlines():
+            s = json.loads(line)
+            t = datetime.fromtimestamp(s["t"])
+            if plan.start <= t < midnight:
+                before = (t, float(s["used"]))
+            elif midnight <= t <= now + timedelta(minutes=1) and after is None:  # incl. the one just taken
+                after = (t, float(s["used"]))
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    if before:
+        t, v = before
+        settled = midnight - t <= timedelta(hours=1) or (after and after[1] == v)
+        return v, "" if settled else f"since {clock(t)}"
+    if after:
+        t, v = after
+        return v, f"since {t:%-I:%M %p}"
+    return None, "estimated from the plan"
+
+
+# ── advice ───────────────────────────────────────────────────────────────────
+def analyse(used: float, now: datetime, plan: Plan, start: float | None = None, start_note: str = "") -> dict:
+    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    if start is None:
+        start = plan.at(midnight)
+    start = min(start, used)  # the meter only climbs within a window
     eod = min(midnight + timedelta(days=1), plan.reset)
     prime_from = midnight + timedelta(hours=Plan.shape(now)[-1][0])
     evening = Plan.shape(now)[-1][0] >= 15  # is the prime block an evening one?
@@ -227,7 +280,9 @@ def analyse(used: float, now: datetime, plan: Plan) -> dict:
         "hours_left": (eod - now) / timedelta(hours=1),
         "tomorrow_target": tomorrow, "tomorrow_nominal": tomorrow - target,
         "week_over": eod >= plan.reset,
-        "day_start": plan.at(midnight), "day_share": target - plan.at(midnight),
+        # today's allowance runs from the day's real starting point to the bedtime target
+        "day_start": start, "day_start_note": start_note,
+        "day_allowance": target - start, "day_used": used - start,
     }
 
 
@@ -302,35 +357,36 @@ def render(a: dict, now: datetime, plan: Plan, session: dict | None, notes: list
     print()
     # under · on pace · over, with the current one lit up
     state = "on pace" if abs(delta) <= TOLERANCE else "over" if delta > 0 else "under"
-    lit = {"under": "1;7;36", "on pace": "1;7;32", "over": "1;7;33"}
-    verdict = " ".join(
-        (c(lit[s], f" {s.upper()} ") if COLOR else f"[{s.upper()}]") if s == state else dim(f" {s} ")
-        for s in lit)
+    # the amount lives inside the lit label so it can't be read against a neighbour
+    lit = {"under": "1;7;32", "on pace": "1;7;32", "over": "1;7;33"}
+    label = state.upper()
     if abs(delta) >= 0.5:
-        verdict += dim(f" by {abs(delta):.1f}%" if state != "on pace" else f" ({abs(delta):.1f}% {'over' if delta > 0 else 'under'})")
+        label += f" by {abs(delta):.1f}%" if state != "on pace" else f" · {abs(delta):.1f}% {'over' if delta > 0 else 'under'}"
+    verdict = " ".join(
+        (c(lit[s], f" {label} ") if COLOR else f"[{label}]") if s == state else dim(f" {s} ")
+        for s in lit)
     print(f"  weekly   {tone('█' * fill)}{dim('░' * (W - fill))}  {bold(f'{used:.0f}%')}  {verdict}")
     print(f"           {' ' * mark}{dim('▲ plan ' + f'{exp:.0f}%')}")
 
-    # today's slice of the weekly bar, zoomed in: from where the plan starts
-    # the day to tonight's bedtime target
-    share, spent = a["day_share"], used - a["day_start"]
+    # today: used since the day began, out of what it takes to reach the
+    # bedtime target from there (so a day started under plan gets more)
+    share, spent = a["day_allowance"], a["day_used"]
     block = "tonight" if a["evening"] else "today"
+    note = dim(f"  ({a['day_start_note']})") if a["day_start_note"] else ""
     if share > 0.05:
-        fill = round(W * min(max(spent, 0), share) / share)
-        mark = min(round(W * (exp - a["day_start"]) / share), W - 1)
+        fill = round(W * min(spent, share) / share)
+        mark = min(max(round(W * (exp - a["day_start"]) / share), 0), W - 1)
         tone = red if spent > share else yellow if delta > TOLERANCE else green
-        label = f"{max(spent, 0):.0f} of {share:.0f}%"
+        label = f"{spent:.0f} of {share:.0f}%"
         if spent > share:
             extra = red(f"{spent - share:.0f}% past {block}'s target")
         else:
             extra = f"{a['room_today']:.0f}% left to {block}'s {a['bedtime_target']:.0f}%"
-            if spent <= -0.5:
-                extra += f" ({-spent:.0f}% banked)"
-        print(f"  today    {tone('█' * fill)}{dim('░' * (W - fill))}  {bold(label)}  {dim('· ')}{extra}")
+        print(f"  today    {tone('█' * fill)}{dim('░' * (W - fill))}  {bold(label)}  {dim('· ')}{extra}{note}")
         print(f"           {' ' * mark}{dim('▲ plan')}")
     else:
-        print(f"  today    {dim('░' * W)}  {dim('nothing planned')}")
-        print()
+        why = f"started the day at {a['day_start']:.0f}%, already at the bedtime target"
+        print(f"  today    {red('█' * W) if spent > 0.5 else dim('░' * W)}  {bold(f'{spent:.0f}% used')}  {dim('· ' + why)}{note}")
 
     pct = (session or {}).get("utilization")
     if pct is not None:
@@ -364,8 +420,11 @@ def main() -> None:
     ap.add_argument("--used", type=float, help="what-if: pretend the weekly meter reads this")
     ap.add_argument("--now", type=datetime.fromisoformat, help="what-if: pretend it is this local time")
     ap.add_argument("-c", "--config", type=Path, default=CONFIG, help=f"plan file (default: {CONFIG})")
+    ap.add_argument("--record", action="store_true", help="log a fresh reading and exit quietly (for cron)")
     args = ap.parse_args()
     load_config(args.config)
+    if args.record:
+        args.fresh, args.used, args.now = True, None, None
 
     notes, session = [], None
     now = args.now or datetime.now()
@@ -377,6 +436,8 @@ def main() -> None:
         week = data.get("seven_day") or {}
         session = data.get("five_hour")
         used = week.get("utilization") or 0.0
+        if args.record:
+            sys.exit(1 if warn else 0)
         if week.get("resets_at"):
             reset = local(week["resets_at"])
     if args.used is not None:
@@ -390,7 +451,7 @@ def main() -> None:
             reset += timedelta(days=7)
 
     plan = Plan(reset - timedelta(days=7), reset)
-    a = analyse(float(used), now, plan)
+    a = analyse(float(used), now, plan, *day_start(now, plan))
 
     if args.json:
         out = {k: (v.isoformat() if isinstance(v, datetime) else v) for k, v in a.items()}

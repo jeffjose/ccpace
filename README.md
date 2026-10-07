@@ -5,10 +5,10 @@ Am I over or under on Claude Code this week — and what should I do about it to
 ```
 Claude Code  Tue 5:58 PM  · week resets Sat 12:00 AM (3d 6h)
 
-  weekly   ████████████████████░░░░░░░░░░░░░░░░░░░░  51%  [UNDER]  on pace   over  by 3.4%
+  weekly   ████████████████████░░░░░░░░░░░░░░░░░░░░  51%  [UNDER by 3.4%]  on pace   over
                                  ▲ plan 54%
-  today    ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  0 of 12%  · 13% left to tonight's 64% (1% banked)
-                   ▲ plan
+  today    █████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  4 of 17%  · 13% left to tonight's 64%
+                                        ▲ plan
   session  ██░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  5%  · 5h window resets 6:40 PM (42m)
 
   Quiet so far — you can go 1.4x tonight (13% vs the usual 10%).
@@ -35,6 +35,7 @@ ccpace              the meter, the plan, and the advice
 ccpace -f           skip the 60s cache and re-fetch
 ccpace -j           print JSON and exit (scripting / statusline)
 ccpace -c FILE      use a different plan file
+ccpace --record     log a reading and exit quietly (for cron)
 ccpace --used 70 --now 2026-10-07T14:00    what-if, no network
 ```
 
@@ -56,6 +57,23 @@ weekend = [[9, 24, 1.0]]
 
 Keys are `mon`…`sun` or the groups `weekday` / `weekend` / `all`. The last
 block of a day is the "prime" block the advice is phrased around.
+
+## The today bar
+
+`4 of 17%` means 4% of the weekly meter used since the day began, out of the
+17% it takes to get from there to tonight's bedtime target. Start a day under
+plan and the allowance grows; start over and it shrinks.
+
+The API only reports the current meter, so ccpace logs every reading it fetches
+to `~/.local/state/ccpace/history.jsonl` and takes the last one before midnight
+as the day's starting point. If that reading is old, the bar says so
+(`since Mon 8:00 PM`); with no history yet it falls back to the plan. For an
+exact figure every day, record on a schedule — one machine is enough, the meter
+is account-wide:
+
+```
+*/30 * * * * ~/.local/bin/ccpace --record
+```
 
 ## How it gets the numbers
 
