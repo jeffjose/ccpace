@@ -1,0 +1,22 @@
+# ccpace plan — copy to ~/.config/ccpace/config.toml and edit.
+# Everything here is optional. With no config, every day gets an equal share
+# of the week, spread flat from 9am to midnight.
+
+# ± points of the weekly meter that still count as "on plan"
+tolerance = 2
+
+# Share of the week each day gets. Only the ratios matter.
+# Keys: mon tue wed thu fri sat sun, or the groups weekday / weekend / all.
+# A named day beats a group, a group beats `all`. 0 means a day off.
+[days]
+weekday = 12
+weekend = 20
+# fri = 6
+
+# How a day's share is spread over the clock, as [from_hour, to_hour, fraction]
+# blocks (24h, decimals ok: 17.5 = 5:30pm). Hours outside every block expect
+# no usage. The last block of the day is the "prime" block the advice is
+# phrased around ("take it easy until 6pm", "go 1.5x tonight").
+[hours]
+weekday = [[9, 18, 0.2], [18, 24, 0.8]]   # trickle during work, most of it in the evening
+weekend = [[9, 24, 1.0]]                  # flat across the day

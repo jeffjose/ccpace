@@ -1,0 +1,377 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# ///
+"""Am I over or under on Claude Code this week? — and what to do about it tonight.
+
+    ccpace              the meter, the plan, and the advice
+    ccpace -f           skip the 60s cache and re-fetch
+    ccpace -j           print JSON and exit (scripting / statusline)
+    ccpace --used 70 --now 2026-10-07T14:00    what-if, no network
+
+The weekly meter is a single number that only means something next to "where
+should it be by now". The plan below answers that: every day of the window gets
+a share of the week ([days]), and every day spreads its share over the
+clock ([hours]). A plan that puts most of a weekday in the 6pm-midnight block
+has barely moved by 2pm and has nearly reached the bedtime number by 11pm.
+
+Live numbers come from the same endpoint `/usage` inside Claude Code reads,
+using the OAuth token Claude Code already keeps in ~/.claude/.credentials.json.
+The token is only read, never refreshed here — Claude Code owns that file.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import time
+import tomllib
+import urllib.error
+import urllib.request
+from datetime import datetime, timedelta
+from pathlib import Path
+
+# ── the plan ─────────────────────────────────────────────────────────────────
+# These are the defaults — every day equal, spread flat over waking hours.
+# Anything in ~/.config/ccpace/config.toml overrides them (see load_config).
+DAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+
+# Share of the week each day gets, Mon=0 … Sun=6. Only the ratios matter; they
+# are normalised over the actual window.
+DAY_WEIGHT = dict.fromkeys(range(7), 1.0)
+
+# How each day's share is spread over the clock: (from_hour, to_hour, fraction).
+# The last block is the "prime" block the advice is phrased around.
+SHAPE = dict.fromkeys(range(7), [(9, 24, 1.0)])
+
+TOLERANCE = 2.0  # ± points of the weekly meter that still count as "on plan"
+
+CONFIG = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "ccpace" / "config.toml"
+
+
+def load_config(path: Path) -> None:
+    """Overlay config.toml on the defaults above. A missing file is fine."""
+    global TOLERANCE
+    try:
+        cfg = tomllib.loads(path.read_text())
+    except FileNotFoundError:
+        return
+    except (OSError, tomllib.TOMLDecodeError) as e:
+        sys.exit(f"ccpace: {path}: {e}")
+
+    def bad(msg):
+        sys.exit(f"ccpace: {path}: {msg}")
+
+    def expand(table: str):
+        # keys are day names, or the groups `weekday` / `weekend` / `all`;
+        # a named day beats a group, a group beats `all`
+        groups = {"all": range(7), "weekday": range(5), "weekend": (5, 6)}
+        raw = cfg.get(table, {})
+        if unknown := set(raw) - set(DAYS) - set(groups):
+            bad(f"[{table}] has unknown key(s): {', '.join(sorted(unknown))}")
+        for key in ("all", "weekday", "weekend", *DAYS):
+            if key in raw:
+                for i in groups.get(key, (DAYS.index(key),) if key in DAYS else ()):
+                    yield i, key, raw[key]
+
+    for i, key, w in expand("days"):
+        if not isinstance(w, (int, float)) or w < 0:
+            bad(f"days.{key} must be a number >= 0")
+        DAY_WEIGHT[i] = float(w)
+    if not any(DAY_WEIGHT.values()):
+        bad("[days] can't all be zero")
+
+    for i, key, blocks in expand("hours"):
+        try:
+            blocks = sorted((float(a), float(b), float(f)) for a, b, f in blocks)
+            ok = blocks and all(0 <= a < b <= 24 and f >= 0 for a, b, f in blocks) \
+                and all(p[1] <= n[0] for p, n in zip(blocks, blocks[1:])) and sum(f for *_, f in blocks) > 0
+        except (TypeError, ValueError):
+            ok = False
+        if not ok:
+            bad(f"hours.{key} must be non-overlapping [from_hour, to_hour, fraction] blocks within 0-24")
+        whole = sum(f for *_, f in blocks)
+        SHAPE[i] = [(a, b, f / whole) for a, b, f in blocks]
+
+    TOLERANCE = float(cfg.get("tolerance", TOLERANCE))
+
+
+# Used only when the API reports no active window (nothing used yet this week).
+FALLBACK_RESET_WEEKDAY, FALLBACK_RESET_HOUR = 5, 0  # Saturday 00:00 local
+
+# ── plumbing ─────────────────────────────────────────────────────────────────
+CREDS = Path.home() / ".claude" / ".credentials.json"
+CACHE = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "ccpace" / "usage.json"
+CACHE_TTL = 60
+USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+
+COLOR = sys.stdout.isatty() and "NO_COLOR" not in os.environ
+
+
+def c(code: str, s: str) -> str:
+    return f"\033[{code}m{s}\033[0m" if COLOR else s
+
+
+def dim(s): return c("2", s)
+def bold(s): return c("1", s)
+def green(s): return c("32", s)
+def yellow(s): return c("33", s)
+def red(s): return c("31", s)
+
+
+def fetch_usage(force: bool) -> tuple[dict, float, str | None]:
+    """Returns (payload, fetched_at, warning). Falls back to a stale cache."""
+    cached = None
+    try:
+        cached = json.loads(CACHE.read_text())
+    except (OSError, ValueError):
+        pass
+    if cached and not force and time.time() - cached["fetched_at"] < CACHE_TTL:
+        return cached["data"], cached["fetched_at"], None
+
+    try:
+        token = json.loads(CREDS.read_text())["claudeAiOauth"]["accessToken"]
+        req = urllib.request.Request(USAGE_URL, headers={
+            "Authorization": f"Bearer {token}",
+            "anthropic-beta": "oauth-2025-04-20",
+            "Content-Type": "application/json",
+            "User-Agent": "ccpace",
+        })
+        with urllib.request.urlopen(req, timeout=15) as r:
+            data = json.loads(r.read())
+    except (OSError, KeyError, ValueError) as e:
+        if isinstance(e, urllib.error.HTTPError) and e.code == 401:
+            why = "token expired — open `claude` once to refresh it"
+        elif isinstance(e, (FileNotFoundError, KeyError)):
+            why = f"no Claude Code login found in {CREDS}"
+        else:
+            why = f"couldn't reach the usage API ({e})"
+        if cached:
+            return cached["data"], cached["fetched_at"], why
+        sys.exit(f"ccpace: {why}")
+
+    now = time.time()
+    try:
+        CACHE.parent.mkdir(parents=True, exist_ok=True)
+        CACHE.write_text(json.dumps({"fetched_at": now, "data": data}))
+    except OSError:
+        pass
+    return data, now, None
+
+
+def local(iso: str) -> datetime:
+    """API timestamp → naive local wall-clock, snapped to the minute."""
+    dt = datetime.fromisoformat(iso).astimezone().replace(tzinfo=None)
+    return (dt + timedelta(seconds=30)).replace(second=0, microsecond=0)
+
+
+# ── the curve ────────────────────────────────────────────────────────────────
+class Plan:
+    """Cumulative expected weekly % at any moment inside [start, reset]."""
+
+    def __init__(self, start: datetime, reset: datetime):
+        self.start, self.reset = start, reset
+        self.segs: list[tuple[datetime, datetime, float]] = []
+        day = start.replace(hour=0, minute=0)
+        while day < reset:
+            for h0, h1, frac in self.shape(day):
+                a, b = day + timedelta(hours=h0), day + timedelta(hours=h1)
+                lo, hi = max(a, start), min(b, reset)
+                if hi > lo:  # clip to the window, keeping a proportional share
+                    self.segs.append((lo, hi, DAY_WEIGHT[day.weekday()] * frac * ((hi - lo) / (b - a))))
+            day += timedelta(days=1)
+        self.total = sum(w for *_, w in self.segs) or 1.0
+
+    @staticmethod
+    def shape(day: datetime):
+        return SHAPE[day.weekday()]
+
+    def at(self, t: datetime) -> float:
+        done = 0.0
+        for a, b, w in self.segs:
+            if t >= b:
+                done += w
+            elif t > a:
+                done += w * ((t - a) / (b - a))
+        return 100.0 * done / self.total
+
+
+# ── advice ───────────────────────────────────────────────────────────────────
+def analyse(used: float, now: datetime, plan: Plan) -> dict:
+    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    eod = min(midnight + timedelta(days=1), plan.reset)
+    prime_from = midnight + timedelta(hours=Plan.shape(now)[-1][0])
+    evening = Plan.shape(now)[-1][0] >= 15  # is the prime block an evening one?
+
+    expected = plan.at(now)
+    target = plan.at(eod)                      # tonight's bedtime number
+    room = target - used                       # what's left to spend today
+    prime_nominal = target - plan.at(prime_from)
+    in_prime = now >= prime_from
+    nominal_left = target - expected           # what the plan still expects today
+    tomorrow = plan.at(min(eod + timedelta(days=1), plan.reset))
+
+    if in_prime:
+        mult = room / nominal_left if nominal_left > 0.05 else None
+    else:
+        mult = room / prime_nominal if prime_nominal > 0.05 else None
+
+    return {
+        "used": used, "expected": expected, "delta": used - expected,
+        "bedtime_target": target, "room_today": room,
+        "prime_nominal": prime_nominal, "prime_from": prime_from, "eod": eod,
+        "in_prime": in_prime, "evening": evening, "multiplier": mult,
+        "trickle_left": 0.0 if in_prime else plan.at(prime_from) - expected,
+        "hours_left": (eod - now) / timedelta(hours=1),
+        "tomorrow_target": tomorrow, "tomorrow_nominal": tomorrow - target,
+        "week_over": eod >= plan.reset,
+    }
+
+
+def advice(a: dict) -> list[str]:
+    block = "tonight" if a["evening"] else "today"
+    normal = "a normal evening" if a["evening"] else "a normal day"
+    room, mult, delta = a["room_today"], a["multiplier"], a["delta"]
+    out = []
+
+    if room <= 0:
+        past = f"already {-room:.0f}% past" if room <= -0.5 else "right at"
+        out.append(red(f"Stop for today — you're {past} {block}'s bedtime target ({a['bedtime_target']:.0f}%)."))
+        if not a["week_over"]:
+            left = a["tomorrow_target"] - a["used"]
+            out.append(f"Anything more comes out of tomorrow, which is down to {max(left, 0):.0f}% "
+                       f"(normally {a['tomorrow_nominal']:.0f}%).")
+        return out
+
+    x = f"{mult:.1f}x" if mult is not None else "—"
+    if a["in_prime"]:
+        rate = room / a["hours_left"] if a["hours_left"] > 0 else 0
+        head = f"{room:.0f}% left for {block} over {a['hours_left']:.1f}h ({rate:.1f}%/h) — {x} the planned pace."
+        if mult is None:  # the plan expects nothing more today (day off, or the last minutes)
+            out.append(green(f"Nothing more planned for today — {room:.0f}% of slack before the bedtime target."))
+        elif delta > TOLERANCE:
+            out.append(yellow("Slow down. ") + head)
+        elif delta < -TOLERANCE:
+            out.append(green("Go harder. ") + head)
+        else:
+            out.append(green("On plan. ") + head)
+    else:
+        usual = a["prime_nominal"]
+        budget = f"{room:.0f}% vs the usual {usual:.0f}%"
+        # what's left for the prime block if the pre-prime trickle carries on as planned
+        keep = max(room - a["trickle_left"], 0)
+        keep_x = f"{keep / usual:.1f}x" if usual > 0.05 else "—"
+        trickling = a["trickle_left"] > 0.3
+        if delta > TOLERANCE:
+            out.append(yellow(f"Take it easy until {a['prime_from']:%-I%p}. ".replace("AM", "am").replace("PM", "pm"))
+                       + f"Stop now and {block} is {x} {normal} ({budget}).")
+            if trickling:
+                out.append(f"Keep trickling at the planned rate and it drops to {keep_x}.")
+        elif delta < -TOLERANCE:
+            out.append(green(f"Quiet so far — you can go {x} {block}") + f" ({budget}).")
+        elif trickling:
+            out.append(green("On plan. ") + f"Keep the daytime trickle ({a['trickle_left']:.0f}%) and {block} is "
+                       f"{keep_x} {normal} ({keep:.0f}% vs the usual {usual:.0f}%).")
+        else:
+            out.append(green("On plan. ") + f"{block.capitalize()} is {x} {normal} ({budget}).")
+    return out
+
+
+# ── rendering ────────────────────────────────────────────────────────────────
+def clock(t: datetime) -> str:
+    return t.strftime("%a %-I:%M %p")
+
+
+def span(td: timedelta) -> str:
+    m = max(int(td.total_seconds() // 60), 0)
+    d, h, m = m // 1440, m % 1440 // 60, m % 60
+    return f"{d}d {h}h" if d else f"{h}h {m}m" if h else f"{m}m"
+
+
+def render(a: dict, now: datetime, plan: Plan, session: dict | None, notes: list[str]) -> None:
+    W = 40
+    used, exp, delta = a["used"], a["expected"], a["delta"]
+    tone = yellow if delta > TOLERANCE else green
+    fill = round(W * min(used, 100) / 100)
+    mark = min(round(W * exp / 100), W - 1)
+
+    print(f"{bold('Claude Code')}  {clock(now)}  {dim('· week resets ' + clock(plan.reset) + ' (' + span(plan.reset - now) + ')')}")
+    print()
+    print(f"  weekly   {tone('█' * fill)}{dim('░' * (W - fill))}  {bold(f'{used:.0f}%')}")
+    print(f"           {' ' * mark}{dim('▲ plan ' + f'{exp:.0f}%')}")
+    if abs(delta) <= TOLERANCE:
+        verdict = green(f"on plan ({delta:+.1f})")
+    elif delta > 0:
+        verdict = yellow(f"{delta:.1f}% OVER plan")
+    else:
+        verdict = green(f"{-delta:.1f}% UNDER plan")
+    print(f"  status   {verdict}")
+    if session and session.get("utilization") is not None:
+        s = f"  session  {session['utilization']:.0f}% of the 5h window"
+        if session.get("resets_at"):
+            s += dim(f" · resets {local(session['resets_at']):%-I:%M %p}")
+        print(s)
+    print()
+    for line in advice(a):
+        print(f"  {line}")
+    print()
+
+    # bedtime readings for the week, today highlighted
+    cells, day = [], plan.start.replace(hour=0, minute=0)
+    while day < plan.reset:
+        cell = f"{day:%a} {plan.at(min(day + timedelta(days=1), plan.reset)):.0f}"
+        cells.append(bold(f"[{cell}]") if day.date() == now.date() else dim(cell))
+        day += timedelta(days=1)
+    print(f"  {dim('bedtime')}  {dim(' · ').join(cells)}")
+    for n in notes:
+        print(dim(f"  ! {n}"))
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="Claude Code weekly usage vs. plan.")
+    ap.add_argument("-f", "--fresh", action="store_true", help="ignore the 60s cache")
+    ap.add_argument("-j", "--json", action="store_true", help="print JSON and exit")
+    ap.add_argument("--used", type=float, help="what-if: pretend the weekly meter reads this")
+    ap.add_argument("--now", type=datetime.fromisoformat, help="what-if: pretend it is this local time")
+    ap.add_argument("-c", "--config", type=Path, default=CONFIG, help=f"plan file (default: {CONFIG})")
+    args = ap.parse_args()
+    load_config(args.config)
+
+    notes, session = [], None
+    now = args.now or datetime.now()
+    reset = None
+    if args.used is None or args.now is None:
+        data, fetched_at, warn = fetch_usage(args.fresh)
+        if warn:
+            notes.append(f"{warn}; showing numbers from {span(timedelta(seconds=time.time() - fetched_at))} ago")
+        week = data.get("seven_day") or {}
+        session = data.get("five_hour")
+        used = week.get("utilization") or 0.0
+        if week.get("resets_at"):
+            reset = local(week["resets_at"])
+    if args.used is not None:
+        used, session = args.used, None
+
+    if reset is None or not (reset - timedelta(days=7) <= now < reset):
+        # no live window (or a what-if outside it): assume the usual reset slot
+        reset = now.replace(hour=FALLBACK_RESET_HOUR, minute=0, second=0, microsecond=0)
+        reset += timedelta(days=(FALLBACK_RESET_WEEKDAY - reset.weekday()) % 7)
+        if reset <= now:
+            reset += timedelta(days=7)
+
+    plan = Plan(reset - timedelta(days=7), reset)
+    a = analyse(float(used), now, plan)
+
+    if args.json:
+        out = {k: (v.isoformat() if isinstance(v, datetime) else v) for k, v in a.items()}
+        out |= {"now": now.isoformat(), "resets_at": reset.isoformat(),
+                "session": (session or {}).get("utilization"), "notes": notes}
+        print(json.dumps(out, indent=2))
+        return
+    render(a, now, plan, session, notes)
+
+
+if __name__ == "__main__":
+    main()
