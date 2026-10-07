@@ -5,10 +5,11 @@ Am I over or under on Claude Code this week — and what should I do about it to
 ```
 Claude Code  Tue 5:58 PM  · week resets Sat 12:00 AM (3d 6h)
 
-  weekly   ████████████████████░░░░░░░░░░░░░░░░░░░░  51%
+  weekly   ████████████████████░░░░░░░░░░░░░░░░░░░░  51%  [UNDER]  on pace   over  by 3.4%
                                  ▲ plan 54%
-  status   3.4% UNDER plan
-  session  5% of the 5h window · resets 6:40 PM
+  today    ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  0 of 12%  · 13% left to tonight's 64% (1% banked)
+                   ▲ plan
+  session  ██░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  5%  · 5h window resets 6:40 PM (42m)
 
   Quiet so far — you can go 1.4x tonight (13% vs the usual 10%).
 

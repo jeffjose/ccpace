@@ -227,6 +227,7 @@ def analyse(used: float, now: datetime, plan: Plan) -> dict:
         "hours_left": (eod - now) / timedelta(hours=1),
         "tomorrow_target": tomorrow, "tomorrow_nominal": tomorrow - target,
         "week_over": eod >= plan.reset,
+        "day_start": plan.at(midnight), "day_share": target - plan.at(midnight),
     }
 
 
@@ -299,19 +300,46 @@ def render(a: dict, now: datetime, plan: Plan, session: dict | None, notes: list
 
     print(f"{bold('Claude Code')}  {clock(now)}  {dim('· week resets ' + clock(plan.reset) + ' (' + span(plan.reset - now) + ')')}")
     print()
-    print(f"  weekly   {tone('█' * fill)}{dim('░' * (W - fill))}  {bold(f'{used:.0f}%')}")
+    # under · on pace · over, with the current one lit up
+    state = "on pace" if abs(delta) <= TOLERANCE else "over" if delta > 0 else "under"
+    lit = {"under": "1;7;36", "on pace": "1;7;32", "over": "1;7;33"}
+    verdict = " ".join(
+        (c(lit[s], f" {s.upper()} ") if COLOR else f"[{s.upper()}]") if s == state else dim(f" {s} ")
+        for s in lit)
+    if abs(delta) >= 0.5:
+        verdict += dim(f" by {abs(delta):.1f}%" if state != "on pace" else f" ({abs(delta):.1f}% {'over' if delta > 0 else 'under'})")
+    print(f"  weekly   {tone('█' * fill)}{dim('░' * (W - fill))}  {bold(f'{used:.0f}%')}  {verdict}")
     print(f"           {' ' * mark}{dim('▲ plan ' + f'{exp:.0f}%')}")
-    if abs(delta) <= TOLERANCE:
-        verdict = green(f"on plan ({delta:+.1f})")
-    elif delta > 0:
-        verdict = yellow(f"{delta:.1f}% OVER plan")
+
+    # today's slice of the weekly bar, zoomed in: from where the plan starts
+    # the day to tonight's bedtime target
+    share, spent = a["day_share"], used - a["day_start"]
+    block = "tonight" if a["evening"] else "today"
+    if share > 0.05:
+        fill = round(W * min(max(spent, 0), share) / share)
+        mark = min(round(W * (exp - a["day_start"]) / share), W - 1)
+        tone = red if spent > share else yellow if delta > TOLERANCE else green
+        label = f"{max(spent, 0):.0f} of {share:.0f}%"
+        if spent > share:
+            extra = red(f"{spent - share:.0f}% past {block}'s target")
+        else:
+            extra = f"{a['room_today']:.0f}% left to {block}'s {a['bedtime_target']:.0f}%"
+            if spent <= -0.5:
+                extra += f" ({-spent:.0f}% banked)"
+        print(f"  today    {tone('█' * fill)}{dim('░' * (W - fill))}  {bold(label)}  {dim('· ')}{extra}")
+        print(f"           {' ' * mark}{dim('▲ plan')}")
     else:
-        verdict = green(f"{-delta:.1f}% UNDER plan")
-    print(f"  status   {verdict}")
-    if session and session.get("utilization") is not None:
-        s = f"  session  {session['utilization']:.0f}% of the 5h window"
+        print(f"  today    {dim('░' * W)}  {dim('nothing planned')}")
+        print()
+
+    pct = (session or {}).get("utilization")
+    if pct is not None:
+        fill = round(W * min(pct, 100) / 100)
+        tone = red if pct >= 90 else yellow if pct >= 75 else green
+        s = f"  session  {tone('█' * fill)}{dim('░' * (W - fill))}  {bold(f'{pct:.0f}%')}"
         if session.get("resets_at"):
-            s += dim(f" · resets {local(session['resets_at']):%-I:%M %p}")
+            r = local(session["resets_at"])
+            s += dim(f"  · 5h window resets {r:%-I:%M %p} ({span(r - now)})")
         print(s)
     print()
     for line in advice(a):
