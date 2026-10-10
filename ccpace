@@ -4,8 +4,9 @@
 # ///
 """Am I over or under on Claude Code this week? — and what to do about it tonight.
 
-    ccpace              the meter, the plan, and the advice
+    ccpace              the card: the meter, the plan, the advice, and the speed
     ccpace -f           skip the 60s cache and re-fetch
+    ccpace -w 30        redraw every 30 seconds (bare -w: every 60); r re-fetches now, q quits
     ccpace -j           print JSON and exit (scripting / statusline)
     ccpace --used 70 --now 2026-10-07T14:00    what-if, no network
 
@@ -23,11 +24,19 @@ The token is only read, never refreshed here — Claude Code owns that file.
 from __future__ import annotations
 
 import argparse
+import bisect
+import contextlib
+import io
 import json
 import os
+import re
+import select
+import shutil
 import sys
+import termios
 import time
 import tomllib
+import tty
 import urllib.error
 import urllib.request
 from datetime import datetime, timedelta
@@ -189,7 +198,7 @@ def fetch_usage(force: bool) -> tuple[dict, float, str | None]:
         CACHE.write_text(json.dumps({"fetched_at": now, "data": data}))
     except OSError:
         pass
-    record((data.get("seven_day") or {}).get("utilization") or 0.0, now)
+    record((data.get("seven_day") or {}).get("utilization") or 0.0, now, data.get("five_hour"))
     return data, now, None
 
 
@@ -236,13 +245,16 @@ class Plan:
 HISTORY = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state") / "ccpace" / "history.jsonl"
 
 
-def record(used: float, t: float) -> None:
+def record(used: float, t: float, session: dict | None = None) -> None:
     try:
         HISTORY.parent.mkdir(parents=True, exist_ok=True)
-        if HISTORY.exists() and HISTORY.stat().st_size > 256_000:  # a week is all that's ever read
-            HISTORY.write_text("".join(HISTORY.read_text().splitlines(keepends=True)[-2000:]))
+        # a week is all that's ever read, and -w adds a line a minute: keep about two
+        if HISTORY.exists() and HISTORY.stat().st_size > 4_000_000:
+            HISTORY.write_text("".join(HISTORY.read_text().splitlines(keepends=True)[-20_000:]))
         with HISTORY.open("a") as f:
-            f.write(json.dumps({"t": round(t), "used": used}) + "\n")
+            # the session numbers ride along so the two meters can be related later
+            f.write(json.dumps({"t": round(t), "used": used, "session": (session or {}).get("utilization"),
+                                "session_resets": (session or {}).get("resets_at")}) + "\n")
     except OSError:
         pass
 
@@ -259,19 +271,6 @@ def readings(plan: Plan, now: datetime) -> list[tuple[datetime, float]]:
     except (OSError, ValueError, KeyError, TypeError):
         pass
     return sorted(out)
-
-
-def closing(log: list[tuple[datetime, float]], begins: datetime, ends: datetime) -> float | None:
-    """What the meter read when a past day ended, if the log can say: the last
-    reading taken that day, or a reading either side of it that agrees."""
-    during = [v for t, v in log if begins <= t < ends]
-    if during:
-        return during[-1]
-    before = [v for t, v in log if t < begins]
-    after = [v for t, v in log if t >= ends]
-    if before and after and before[-1] == after[0]:
-        return after[0]
-    return None
 
 
 def day_start(now: datetime, plan: Plan) -> tuple[float | None, str]:
@@ -299,6 +298,57 @@ def day_start(now: datetime, plan: Plan) -> tuple[float | None, str]:
         t, v = after
         return v, f"since {t:%-I:%M %p}"
     return None, "estimated from the plan"
+
+
+# ── speed ────────────────────────────────────────────────────────────────────
+# How fast the meter moved over a stretch, as a multiple of how fast the plan
+# said it should: 1.0 is exactly the planned rate, 2.0 is twice it.
+ON_PACE = 0.15                 # ± this much of the planned rate still counts as on pace
+GAP = timedelta(minutes=90)    # readings further apart than this can only be interpolated roughly
+
+
+def plan_days(plan: Plan, now: datetime):
+    """The window's plan-days as (anchor, begins, ends, is_today), clipped to it."""
+    day = anchor(plan.start)
+    while (begins := day + timedelta(hours=DAY_STARTS)) < plan.reset:
+        begins, ends = max(begins, plan.start), min(begins + timedelta(days=1), plan.reset)
+        today = day == anchor(now)
+        if today or ends - begins >= timedelta(hours=6):  # skip the sliver a reset leaves behind
+            yield day, begins, ends, today
+        day += timedelta(days=1)
+
+
+def meter_at(log: list[tuple[datetime, float]], t: datetime) -> tuple[float, bool]:
+    """What the meter read at `t`, interpolated between the readings either
+    side of it, and whether that is a rough guess (they disagree across a gap).
+    `log` must bracket `t`."""
+    i = bisect.bisect_right([s for s, _ in log], t)
+    (t0, v0), (t1, v1) = log[i - 1], log[min(i, len(log) - 1)]
+    if v0 == v1 or t1 <= t0:
+        return v0, False
+    return v0 + (v1 - v0) * ((t - t0) / (t1 - t0)), t1 - t0 > GAP
+
+
+def speeds(used: float, now: datetime, plan: Plan) -> list[dict]:
+    """Actual vs planned movement over the last hour and over each day of the window."""
+    # the meter starts the window at zero and reads `used` right now
+    log = [(plan.start, 0.0), *((t, v) for t, v in readings(plan, now) if plan.start < t < now), (now, used)]
+
+    def over(label: str, lo: datetime, hi: datetime, **more) -> dict:
+        (v0, r0), (v1, r1) = meter_at(log, lo), meter_at(log, hi)
+        moved, planned = max(v1 - v0, 0.0), plan.at(hi) - plan.at(lo)
+        return {"label": label, "from": lo, "to": hi, "used": moved, "planned": planned, "meter": v1,
+                "speed": moved / planned if planned > 0.05 else None, "rough": r0 or r1, **more}
+
+    rows = [over("last 1h", max(now - timedelta(hours=1), plan.start), now)]
+    for day, begins, ends, today in plan_days(plan, now):
+        # `target` is where the plan has the meter when the day closes
+        if begins < now:
+            rows.append(over(f"{day:%a}", begins, min(ends, now), today=today, target=plan.at(ends)))
+        else:
+            rows.append({"label": f"{day:%a}", "from": begins, "to": ends, "speed": None, "ahead": True,
+                         "planned": plan.at(ends) - plan.at(begins), "target": plan.at(ends)})
+    return rows
 
 
 # ── advice ───────────────────────────────────────────────────────────────────
@@ -399,15 +449,33 @@ def span(td: timedelta) -> str:
     return f"{d}d {h}h" if d else f"{h}h {m}m" if h else f"{m}m"
 
 
-def render(a: dict, now: datetime, plan: Plan, session: dict | None, notes: list[str]) -> None:
-    W = 40
+def card(title: str, aside: str, lines: list[str]) -> None:
+    """Print `lines` in a box, title and aside set into the top edge. Falls
+    back to plain lines when the terminal is too narrow for the box."""
+    def width(s: str) -> int:
+        return len(re.sub(r"\033\[[0-9;]*m", "", s))
+
+    inner = max(map(width, lines)) + 2
+    if inner + 2 > shutil.get_terminal_size((10_000, 24)).columns:
+        print(f"{title}  {aside}\n")
+        print("\n".join(lines))
+        return
+    rule = "─" * max(inner - width(title) - width(aside) - 6, 1)
+    print(f"{dim('╭─')} {title} {dim(rule)} {aside} {dim('─╮')}")
+    for line in ["", *lines, ""]:
+        print(f"{dim('│')}{line}{' ' * (inner - width(line))}{dim('│')}")
+    print(dim(f"╰{'─' * inner}╯"))
+
+
+def render(a: dict, now: datetime, plan: Plan, session: dict | None, notes: list[str], speed: list[dict]) -> None:
+    W = 41
     used, exp, delta = a["used"], a["expected"], a["delta"]
     tone = yellow if delta > TOLERANCE else green
     fill = round(W * min(used, 100) / 100)
     mark = min(round(W * exp / 100), W - 1)
+    out: list[str] = []
+    p = out.append
 
-    print(f"{bold('Claude Code')}  {clock(now)}  {dim('· week resets ' + clock(plan.reset) + ' (' + span(plan.reset - now) + ')')}")
-    print()
     # under · on pace · over, with the current one lit up
     state = "on pace" if abs(delta) <= TOLERANCE else "over" if delta > 0 else "under"
     # the amount lives inside the lit label so it can't be read against a neighbour
@@ -418,8 +486,8 @@ def render(a: dict, now: datetime, plan: Plan, session: dict | None, notes: list
     verdict = " ".join(
         (c(lit[s], f" {label} ") if COLOR else f"[{label}]") if s == state else dim(f" {s} ")
         for s in lit)
-    print(f"  weekly   {tone('█' * fill)}{dim('░' * (W - fill))}  {bold(f'{used:.0f}%')}  {verdict}")
-    print(f"           {' ' * mark}{dim(f'▲ expected by now: {exp:.0f}%')}")
+    p(f"  weekly   {tone('█' * fill)}{dim('░' * (W - fill))}  {bold(f'{used:.0f}%')}  {verdict}")
+    p(f"           {' ' * mark}{dim(f'▲ expected by now: {exp:.0f}%')}")
 
     # today: used since the day began, out of what it takes to reach the
     # bedtime target from there (so a day started under plan gets more)
@@ -435,11 +503,11 @@ def render(a: dict, now: datetime, plan: Plan, session: dict | None, notes: list
             extra = red(f"{spent - share:.0f}% past {block}'s target")
         else:
             extra = f"{a['room_today']:.0f}% left to {block}'s {a['bedtime_target']:.0f}%"
-        print(f"  today    {tone('█' * fill)}{dim('░' * (W - fill))}  {bold(label)}  {dim('· ')}{extra}{note}")
-        print(f"           {' ' * mark}{dim('▲ expected by now')}")
+        p(f"  today    {tone('█' * fill)}{dim('░' * (W - fill))}  {bold(label)}  {dim('· ')}{extra}{note}")
+        p(f"           {' ' * mark}{dim('▲ expected by now')}")
     else:
         why = f"started the day at {a['day_start']:.0f}%, already at the bedtime target"
-        print(f"  today    {red('█' * W) if spent > 0.5 else dim('░' * W)}  {bold(f'{spent:.0f}% used')}  {dim('· ' + why)}{note}")
+        p(f"  today   {red('█' * W) if spent > 0.5 else dim('░' * W)}  {bold(f'{spent:.0f}% used')}  {dim('· ' + why)}{note}")
 
     pct = (session or {}).get("utilization")
     if pct is not None:
@@ -449,33 +517,49 @@ def render(a: dict, now: datetime, plan: Plan, session: dict | None, notes: list
         if session.get("resets_at"):
             r = local(session["resets_at"])
             s += dim(f"  · 5h window resets {r:%-I:%M %p} ({span(r - now)})")
-        print(s)
-    print()
+        p(s)
+    p("")
     for line in advice(a):
-        print(f"  {line}")
-    print()
+        p(f"  {line}")
+    p("")
 
-    # the week as a table: where the meter should close each day, and where it did
-    log, rows, day = readings(plan, now), [[], [], []], anchor(plan.start)
-    while (begins := day + timedelta(hours=DAY_STARTS)) < plan.reset:
-        begins, ends = max(begins, plan.start), min(begins + timedelta(days=1), plan.reset)
-        today = day == anchor(now)
-        if today or ends - begins >= timedelta(hours=6):  # skip the sliver a reset leaves behind
-            if today:
-                actual = f"{used:.0f}"
-            elif ends <= now:
-                v = closing(log, begins, ends)
-                actual = "?" if v is None else f"{v:.0f}"
-            else:
-                actual = "·"
-            style = bold if today else dim
-            for row, text in zip(rows, (f"{day:%a}", f"{plan.at(ends):.0f}", actual)):
-                row.append(style(f"{text:>5}"))
-        day += timedelta(days=1)
-    for name, row in zip(("", "target", "actual"), rows):
-        print(f"  {dim(f'{name:<7}')}{''.join(row)}")
+    # speed: each stretch as a bar off the planned rate — slow grows left, fast
+    # grows right, and the right edge is 2× the plan. The columns after it are
+    # what moved vs what was planned, and where the meter closed vs its target.
+    H = W // 2
+
+    def pct(x: float) -> str:
+        return f"{x:.1f}" if x < 10 else f"{x:.0f}"
+
+    p(dim(f"  {'speed':<9}{'◀ slow':<18}{'plan':^5}{'fast ▶':>18}{'':16}{'used':>6}{'plan':>6}{'meter':>7}{'target':>7}"))
+    for r in speed:
+        style = bold if r.get("today") else dim
+        s, ahead = r["speed"], r.get("ahead")
+        cols = (f"{'·' if ahead else pct(r['used']):>6}{pct(r['planned']):>6}"
+                + (f"{'·' if ahead else format(r['meter'], '.0f'):>7}{r['target']:>7.0f}" if "target" in r else ""))
+        if s is None:
+            p(f"  {style(f'{r['label']:<9}')}{dim('░' * H + '│' + '░' * H)}{'':16}{style(cols)}")
+            continue
+        n = min(round(abs(s - 1) * H), H)
+        word = "on pace" if abs(s - 1) <= ON_PACE else "slow" if s < 1 else "fast"
+        tone = red if word == "fast" else green
+        left, right = (n, 0) if s < 1 else (0, n)
+        bar = (dim("░" * (H - left)) + tone("█" * left) + tone("┃" if word == "on pace" else "│")
+               + tone("█" * right) + dim("░" * (H - right)))
+        times = ("~" if r["rough"] else "") + f"{s:.1f}×"
+        p(f"  {style(f'{r['label']:<9}')}{bar}  {tone(bold(f'{times:>5}'))} {tone(f'{word:<7}')} {style(cols)}")
+        # the rate that would land tonight's number from here, on the same scale
+        left_today = a["bedtime_target"] - exp
+        if r is speed[0] and left_today > 0.05 and a["room_today"] > 0:
+            need = a["room_today"] / left_today
+            mark = round(H + (min(need, 2.0) - 1) * H)
+            p(f"           {' ' * mark}" + dim(f"▲ {need:.1f}× from here lands {block}'s {a['bedtime_target']:.0f}%"))
+    if any(r.get("rough") for r in speed):
+        p(dim("  ~ interpolated across a gap in the history"))
     for n in notes:
-        print(dim(f"  ! {n}"))
+        p(dim(f"  ! {n}"))
+
+    card(bold("Claude Code"), dim(f"{clock(now)} · week resets {clock(plan.reset)} ({span(plan.reset - now)})"), out)
 
 
 def main() -> None:
@@ -486,11 +570,56 @@ def main() -> None:
     ap.add_argument("--now", type=datetime.fromisoformat, help="what-if: pretend it is this local time")
     ap.add_argument("-c", "--config", type=Path, default=CONFIG, help=f"plan file (default: {CONFIG})")
     ap.add_argument("--record", action="store_true", help="log a fresh reading and exit quietly (for cron)")
+    ap.add_argument("-w", "--watch", type=float, nargs="?", const=CACHE_TTL, metavar="SECS",
+                    help=f"redraw every SECS seconds (default: {CACHE_TTL}); r re-fetches now, q quits")
     args = ap.parse_args()
     load_config(args.config)
     if args.record:
         args.fresh, args.used, args.now = True, None, None
+    if args.watch is None:
+        return show(args)
+    if args.json or args.record:
+        ap.error("-w can't be combined with --json or --record")
+    if args.watch <= 0:
+        ap.error("-w needs a positive number of seconds")
 
+    # keys need a real terminal: cbreak hands them over unbuffered and unechoed,
+    # and still leaves ctrl-c to the tty
+    keys, fresh = sys.stdin.isatty(), args.fresh
+    if keys:
+        fd = sys.stdin.fileno()
+        saved = termios.tcgetattr(fd)
+        tty.setcbreak(fd)
+    hint = "r to refresh now · q to quit" if keys else "ctrl-c to quit"
+    try:
+        while True:
+            # draw into a buffer first so the screen never sits blank during a fetch
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                show(args)
+                print(dim(f"  every {args.watch:g}s · {hint}"))
+            sys.stdout.write("\033[H\033[2J" + buf.getvalue())
+            sys.stdout.flush()
+            args.fresh = fresh
+            if not keys:
+                time.sleep(args.watch)
+                continue
+            due = time.monotonic() + args.watch
+            while (left := due - time.monotonic()) > 0 and select.select([fd], [], [], left)[0]:
+                key = os.read(fd, 1).lower()
+                if key in (b"q", b""):
+                    return
+                if key == b"r":
+                    args.fresh = True  # this one redraw skips the cache
+                    break
+    except KeyboardInterrupt:
+        print()
+    finally:
+        if keys:
+            termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+
+
+def show(args: argparse.Namespace) -> None:
     notes, session = [], None
     now = args.now or datetime.now()
     reset = None
@@ -517,14 +646,14 @@ def main() -> None:
 
     plan = Plan(reset - timedelta(days=7), reset)
     a = analyse(float(used), now, plan, *day_start(now, plan))
+    speed = speeds(float(used), now, plan)
 
     if args.json:
-        out = {k: (v.isoformat() if isinstance(v, datetime) else v) for k, v in a.items()}
-        out |= {"now": now.isoformat(), "resets_at": reset.isoformat(),
-                "session": (session or {}).get("utilization"), "notes": notes}
-        print(json.dumps(out, indent=2))
+        out = a | {"now": now, "resets_at": reset, "session": (session or {}).get("utilization"),
+                   "notes": notes, "speed": speed}
+        print(json.dumps(out, indent=2, default=datetime.isoformat))
         return
-    render(a, now, plan, session, notes)
+    render(a, now, plan, session, notes, speed)
 
 
 if __name__ == "__main__":
