@@ -238,6 +238,14 @@ class Plan:
                 done += w * ((t - a) / (b - a))
         return 100.0 * done / self.total
 
+    def when(self, pct: float) -> datetime:
+        """The first moment the plan reaches `pct` — `at`, inverted."""
+        lo, hi = self.start, self.reset
+        for _ in range(40):
+            mid = lo + (hi - lo) / 2
+            lo, hi = (lo, mid) if self.at(mid) >= pct else (mid, hi)
+        return hi
+
 
 # ── history ──────────────────────────────────────────────────────────────────
 # Every live reading is appended here so "today" can be measured from what the
@@ -281,7 +289,7 @@ def day_start(now: datetime, plan: Plan) -> tuple[float | None, str]:
     none, the first reading of today is used, which misses whatever came
     before it. (None, ...) means there is nothing to go on.
     """
-    midnight = anchor(now) + timedelta(hours=DAY_STARTS)  # when today began
+    midnight = today_of(plan, now)[1]  # when today began
     if midnight <= plan.start:
         return 0.0, ""  # first day of the window: the meter started at zero
     before = after = None
@@ -308,14 +316,29 @@ GAP = timedelta(minutes=90)    # readings further apart than this can only be in
 
 
 def plan_days(plan: Plan, now: datetime):
-    """The window's plan-days as (anchor, begins, ends, is_today), clipped to it."""
-    day = anchor(plan.start)
+    """The window's plan-days as (anchor, begins, ends, is_today), clipped to it.
+    The hours between the reset and the first rollover (Sat 12-2am, say) go on
+    the first full day's account rather than standing as a day of their own."""
+    day, lead = anchor(plan.start), None
     while (begins := day + timedelta(hours=DAY_STARTS)) < plan.reset:
         begins, ends = max(begins, plan.start), min(begins + timedelta(days=1), plan.reset)
         today = day == anchor(now)
-        if today or ends - begins >= timedelta(hours=6):  # skip the sliver a reset leaves behind
+        if begins == plan.start and ends - begins < timedelta(hours=6):
+            lead = (begins, today)
+        elif today or ends - begins >= timedelta(hours=6):  # skip the sliver a reset leaves behind
+            if lead:
+                begins, today, lead = lead[0], today or lead[1], None
             yield day, begins, ends, today
         day += timedelta(days=1)
+
+
+def today_of(plan: Plan, now: datetime) -> tuple[datetime, datetime, datetime]:
+    """(anchor, begins, ends) of the plan-day `now` falls in."""
+    for day, begins, ends, today in plan_days(plan, now):
+        if today:
+            return day, begins, ends
+    begins = anchor(now) + timedelta(hours=DAY_STARTS)
+    return anchor(now), begins, begins + timedelta(days=1)
 
 
 def meter_at(log: list[tuple[datetime, float]], t: datetime) -> tuple[float, bool]:
@@ -329,37 +352,56 @@ def meter_at(log: list[tuple[datetime, float]], t: datetime) -> tuple[float, boo
     return v0 + (v1 - v0) * ((t - t0) / (t1 - t0)), t1 - t0 > GAP
 
 
-def speeds(used: float, now: datetime, plan: Plan) -> list[dict]:
-    """Actual vs planned movement over the last hour and over each day of the window."""
+def speeds(used: float, now: datetime, plan: Plan, bedtime: float) -> list[dict]:
+    """What the meter moved against its budget, over the last hour and over
+    each day of the window. `bedtime` is tonight's target for the meter."""
     # the meter starts the window at zero and reads `used` right now
     log = [(plan.start, 0.0), *((t, v) for t, v in readings(plan, now) if plan.start < t < now), (now, used)]
 
-    def over(label: str, lo: datetime, hi: datetime, **more) -> dict:
+    def over(label: str, lo: datetime, hi: datetime, live: bool = False, **more) -> dict:
         (v0, r0), (v1, r1) = meter_at(log, lo), meter_at(log, hi)
         moved, planned = max(v1 - v0, 0.0), plan.at(hi) - plan.at(lo)
-        return {"label": label, "from": lo, "to": hi, "used": moved, "planned": planned, "meter": v1,
-                "speed": moved / planned if planned > 0.05 else None, "rough": r0 or r1, **more}
+        budget = planned
+        # a finished day is held to the plan. One still in play is held to the
+        # rate that lands tonight's target from where the stretch began, so a
+        # day spent catching up reads as on pace, not fast
+        if live and bedtime - plan.at(lo) > 0.05:
+            budget = planned * max(bedtime - v0, 0.0) / (bedtime - plan.at(lo))
+        speed = min(moved / budget, 9.9) if budget > 0.05 else None  # no budget, nothing to measure against
+        row = {"label": label, "from": lo, "to": hi, "used": moved, "planned": planned, "budget": budget,
+               "meter": v1, "speed": speed, "rough": r0 or r1, **more}
+        # where the week ends if the rest of it runs at this stretch's multiple
+        # of the plan (so nights and quiet days stay quiet), and when it fills
+        if more.get("recent") and planned > 0.05:
+            pace = moved / planned
+            row["thin"] = 0 < moved < 2  # the meter moves in whole points: one tick is no rate at all
+            row["ends"] = v1 + pace * (100.0 - plan.at(hi))
+            if row["ends"] > 100.0 and v1 < 100.0:
+                row["full_at"] = plan.when(plan.at(hi) + (100.0 - v1) / pace)
+        return row
 
-    rows = [over("last 1h", max(now - timedelta(hours=1), plan.start), now)]
+    rows = [over(f"last {name}", max(now - timedelta(minutes=m), plan.start), now, live=True, recent=True)
+            for name, m in (("15m", 15), ("1h", 60), ("6h", 360))]
     for day, begins, ends, today in plan_days(plan, now):
         # `target` is where the plan has the meter when the day closes
         if begins < now:
-            rows.append(over(f"{day:%a}", begins, min(ends, now), today=today, target=plan.at(ends)))
+            rows.append(over(f"{day:%a}", begins, min(ends, now), live=today, today=today, target=plan.at(ends)))
         else:
+            share = plan.at(ends) - plan.at(begins)
             rows.append({"label": f"{day:%a}", "from": begins, "to": ends, "speed": None, "ahead": True,
-                         "planned": plan.at(ends) - plan.at(begins), "target": plan.at(ends)})
+                         "planned": share, "budget": share, "target": plan.at(ends)})
     return rows
 
 
 # ── advice ───────────────────────────────────────────────────────────────────
 def analyse(used: float, now: datetime, plan: Plan, start: float | None = None, start_note: str = "") -> dict:
-    midnight = anchor(now) + timedelta(hours=DAY_STARTS)  # when today began
+    day, midnight, eod = today_of(plan, now)  # midnight: when today began
     if start is None:
         start = plan.at(midnight)
     start = min(start, used)  # the meter only climbs within a window
-    eod = min(midnight + timedelta(days=1), plan.reset)
-    prime_from = anchor(now) + timedelta(hours=Plan.shape(now)[-1][0])
-    evening = Plan.shape(now)[-1][0] >= 15  # is the prime block an evening one?
+    prime = SHAPE[day.weekday()][-1][0]
+    prime_from = day + timedelta(hours=prime)
+    evening = prime >= 15  # is the prime block an evening one?
 
     expected = plan.at(now)
     target = plan.at(eod)                      # tonight's bedtime number
@@ -449,11 +491,29 @@ def span(td: timedelta) -> str:
     return f"{d}d {h}h" if d else f"{h}h {m}m" if h else f"{m}m"
 
 
+ANSI = re.compile(r"\033\[[0-9;]*m")
+
+
+def wrap(s: str, width: int) -> list[str]:
+    """Word-wrap to `width` visible columns, carrying any colour over the break."""
+    lines, line, n, on = [], "", 0, ""
+    for word in s.split(" "):
+        w = len(ANSI.sub("", word))
+        if n and n + 1 + w > width:
+            lines.append(line + ("\033[0m" if on else ""))
+            line, n = on, 0
+        line += (" " if n else "") + word
+        n += w + (1 if n else 0)
+        for code in ANSI.findall(word):
+            on = "" if code == "\033[0m" else code
+    return [*lines, line]
+
+
 def card(title: str, aside: str, lines: list[str]) -> None:
     """Print `lines` in a box, title and aside set into the top edge. Falls
     back to plain lines when the terminal is too narrow for the box."""
     def width(s: str) -> int:
-        return len(re.sub(r"\033\[[0-9;]*m", "", s))
+        return len(ANSI.sub("", s))
 
     inner = max(map(width, lines)) + 2
     if inner + 2 > shutil.get_terminal_size((10_000, 24)).columns:
@@ -468,75 +528,94 @@ def card(title: str, aside: str, lines: list[str]) -> None:
 
 
 def render(a: dict, now: datetime, plan: Plan, session: dict | None, notes: list[str], speed: list[dict]) -> None:
-    W = 41
+    W = 25
     used, exp, delta = a["used"], a["expected"], a["delta"]
-    tone = yellow if delta > TOLERANCE else green
-    fill = round(W * min(used, 100) / 100)
-    mark = min(round(W * exp / 100), W - 1)
+    block = "tonight" if a["evening"] else "today"
     out: list[str] = []
     p = out.append
 
-    # under · on pace · over, with the current one lit up
+    def pct(x: float) -> str:
+        return f"{x:.1f}" if x < 10 else f"{x:.0f}"
+
+    def meter(name: str, frac: float, tone, at: float | None = None, gist: str = "",
+              used: str = "", expect: str = "", note: str = "") -> None:
+        """One row of the top table: a bar with the expected point struck
+        through it, the gist in a word or two, then the numbers."""
+        fill = round(W * min(max(frac, 0.0), 1.0))
+        cells = [tone("█")] * fill + [dim("░")] * (W - fill)
+        if at is not None:
+            cells[min(max(round(W * at), 0), W - 1)] = bold("┃")
+        p(f"  {dim(f'{name:<9}')}{''.join(cells)}  {tone(f'{gist:<14}')}{bold(f'{used:>6}')}{dim(f'{expect:>8}')}"
+          + (f"   {note}" if note else ""))
+
+    # the verdict first: under · on pace · over, with the current one lit up
     state = "on pace" if abs(delta) <= TOLERANCE else "over" if delta > 0 else "under"
     # the amount lives inside the lit label so it can't be read against a neighbour
     lit = {"under": "1;7;32", "on pace": "1;7;32", "over": "1;7;33"}
     label = state.upper()
     if abs(delta) >= 0.5:
         label += f" by {abs(delta):.1f}%" if state != "on pace" else f" · {abs(delta):.1f}% {'over' if delta > 0 else 'under'}"
-    verdict = " ".join(
+    p(" " + " ".join(
         (c(lit[s], f" {label} ") if COLOR else f"[{label}]") if s == state else dim(f" {s} ")
-        for s in lit)
-    p(f"  weekly   {tone('█' * fill)}{dim('░' * (W - fill))}  {bold(f'{used:.0f}%')}  {verdict}")
-    p(f"           {' ' * mark}{dim(f'▲ expected by now: {exp:.0f}%')}")
+        for s in lit))
+    for line in advice(a):
+        out.extend(f"  {part}" for part in wrap(line, W + 53))  # as wide as the tables below
+    p("")
+
+    p(dim(f"  {'meter':<9}{'':{W}}{'':16}{'used':>6}{'expect':>8}"))
+    meter("week", used / 100, yellow if delta > TOLERANCE else green, exp / 100,
+          f"{delta:+5.1f} {state}", f"{used:.0f}%", f"{exp:.0f}%")
 
     # today: used since the day began, out of what it takes to reach the
     # bedtime target from there (so a day started under plan gets more)
     share, spent = a["day_allowance"], a["day_used"]
-    block = "tonight" if a["evening"] else "today"
-    note = dim(f"  ({a['day_start_note']})") if a["day_start_note"] else ""
     if share > 0.05:
-        fill = round(W * min(spent, share) / share)
-        mark = min(max(round(W * (exp - a["day_start"]) / share), 0), W - 1)
+        due = max(exp - a["day_start"], 0.0)  # of today's allowance, what was expected by now
         tone = red if spent > share else yellow if delta > TOLERANCE else green
-        label = f"{spent:.0f} of {share:.0f}%"
-        if spent > share:
-            extra = red(f"{spent - share:.0f}% past {block}'s target")
-        else:
-            extra = f"{a['room_today']:.0f}% left to {block}'s {a['bedtime_target']:.0f}%"
-        p(f"  today    {tone('█' * fill)}{dim('░' * (W - fill))}  {bold(label)}  {dim('· ')}{extra}{note}")
-        p(f"           {' ' * mark}{dim('▲ expected by now')}")
-    else:
-        why = f"started the day at {a['day_start']:.0f}%, already at the bedtime target"
-        p(f"  today   {red('█' * W) if spent > 0.5 else dim('░' * W)}  {bold(f'{spent:.0f}% used')}  {dim('· ' + why)}{note}")
+        gist = f"{spent - share:4.0f}% past" if spent > share else f"{a['room_today']:4.0f}% left"
+        meter("today", spent / share, tone, due / share, gist, f"{spent:.0f}%", f"{due:.0f}%", dim(f"of {share:.0f}%"))
+    else:  # the day began at or past its bedtime target
+        meter("today", 1.0 if spent > 0.5 else 0.0, red, gist="    at target", used=f"{spent:.0f}%", expect="·",
+              note=dim(f"began at {a['day_start']:.0f}%"))
 
-    pct = (session or {}).get("utilization")
-    if pct is not None:
-        fill = round(W * min(pct, 100) / 100)
-        tone = red if pct >= 90 else yellow if pct >= 75 else green
-        s = f"  session  {tone('█' * fill)}{dim('░' * (W - fill))}  {bold(f'{pct:.0f}%')}"
+    busy = (session or {}).get("utilization")
+    if busy is not None:
+        gist = note = ""
         if session.get("resets_at"):
             r = local(session["resets_at"])
-            s += dim(f"  · 5h window resets {r:%-I:%M %p} ({span(r - now)})")
-        p(s)
-    p("")
-    for line in advice(a):
-        p(f"  {line}")
+            gist, note = f"resets in {span(r - now)}", dim(f"at {r:%-I:%M %p}")
+        meter("session", busy / 100, red if busy >= 90 else yellow if busy >= 75 else green, gist=gist,
+              used=f"{busy:.0f}%", note=note)
     p("")
 
-    # speed: each stretch as a bar off the planned rate — slow grows left, fast
-    # grows right, and the right edge is 2× the plan. The columns after it are
-    # what moved vs what was planned, and where the meter closed vs its target.
+    # speed: each stretch as a bar off its budget — slow grows left, fast grows
+    # right, and the right edge is 2× the budget. The columns after it are what
+    # moved vs that budget, and where the meter closed vs its target.
     H = W // 2
 
-    def pct(x: float) -> str:
-        return f"{x:.1f}" if x < 10 else f"{x:.0f}"
+    def heading(name: str, scale: str, *cols: str) -> str:
+        return dim(f"  {name:<9}{scale:<{W}}{'':16}{'used':>6}{'budget':>8}{''.join(cols)}")
 
-    p(dim(f"  {'speed':<9}{'◀ slow':<18}{'plan':^5}{'fast ▶':>18}{'':16}{'used':>6}{'plan':>6}{'meter':>7}{'target':>7}"))
-    for r in speed:
+    p(heading("speed", f"{'◀ slow':<{H - 3}}{'on pace':^7}{'fast ▶':>{H - 3}}", f"{'meter':>7}", f"{'target':>7}"))
+    recent = [r for r in speed if r.get("recent")]
+    for r in (*(r for r in speed if not r.get("recent")), None, *recent):  # the days, then the last few hours
+        if r is None:
+            # these project the week: where the meter ends at that pace, and when it would fill
+            p("")
+            p(heading("lately", "", f"{'at reset':>9}", f"{'full':>10}"))
+            continue
         style = bold if r.get("today") else dim
         s, ahead = r["speed"], r.get("ahead")
-        cols = (f"{'·' if ahead else pct(r['used']):>6}{pct(r['planned']):>6}"
+        cols = (f"{'·' if ahead else pct(r['used']):>6}{pct(r['budget']):>8}"
                 + (f"{'·' if ahead else format(r['meter'], '.0f'):>7}{r['target']:>7.0f}" if "target" in r else ""))
+        if "ends" in r:
+            unsure = "?" if r["thin"] else ""
+            ends = f"{min(r['ends'], 999):.0f}%{unsure}"
+            cols += (red if r["ends"] > 100 + TOLERANCE else green)(f"{ends:>9}")
+            if "full_at" in r:
+                # to the minute when it's today, else the day and hour are enough
+                near = r["full_at"].date() == now.date()
+                cols += red((f"{r['full_at']:{'%-I:%M%p' if near else '%a %-I%p'}}" + unsure).rjust(10))
         if s is None:
             p(f"  {style(f'{r['label']:<9}')}{dim('░' * H + '│' + '░' * H)}{'':16}{style(cols)}")
             continue
@@ -548,12 +627,12 @@ def render(a: dict, now: datetime, plan: Plan, session: dict | None, notes: list
                + tone("█" * right) + dim("░" * (H - right)))
         times = ("~" if r["rough"] else "") + f"{s:.1f}×"
         p(f"  {style(f'{r['label']:<9}')}{bar}  {tone(bold(f'{times:>5}'))} {tone(f'{word:<7}')} {style(cols)}")
-        # the rate that would land tonight's number from here, on the same scale
-        left_today = a["bedtime_target"] - exp
-        if r is speed[0] and left_today > 0.05 and a["room_today"] > 0:
-            need = a["room_today"] / left_today
-            mark = round(H + (min(need, 2.0) - 1) * H)
-            p(f"           {' ' * mark}" + dim(f"▲ {need:.1f}× from here lands {block}'s {a['bedtime_target']:.0f}%"))
+    p("")
+    p(dim(f"  today and lately: vs the pace that lands {block}'s {a['bedtime_target']:.0f}% · past days: vs the plan"))
+    if a["day_start_note"]:
+        p(dim(f"  today's start: {a['day_start_note']}"))
+    if any(r.get("thin") for r in speed):
+        p(dim("  ? projected from a single tick of the meter"))
     if any(r.get("rough") for r in speed):
         p(dim("  ~ interpolated across a gap in the history"))
     for n in notes:
@@ -646,7 +725,7 @@ def show(args: argparse.Namespace) -> None:
 
     plan = Plan(reset - timedelta(days=7), reset)
     a = analyse(float(used), now, plan, *day_start(now, plan))
-    speed = speeds(float(used), now, plan)
+    speed = speeds(float(used), now, plan, a["bedtime_target"])
 
     if args.json:
         out = a | {"now": now, "resets_at": reset, "session": (session or {}).get("utilization"),
