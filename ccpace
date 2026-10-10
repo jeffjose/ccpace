@@ -8,6 +8,8 @@
     ccpace -f           skip the 60s cache and re-fetch
     ccpace -w 30        redraw every 30 seconds (bare -w: every 60); r re-fetches now, q quits
     ccpace -j           print JSON and exit (scripting / statusline)
+    ccpace --plain      the card with no box and no colour (for pasting or posting)
+    ccpace --strict     exit non-zero, with the reason, rather than show a cached reading
     ccpace --used 70 --now 2026-10-07T14:00    what-if, no network
 
 The weekly meter is a single number that only means something next to "where
@@ -41,6 +43,7 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 # ── the plan ─────────────────────────────────────────────────────────────────
 # These are the defaults — every day equal, spread flat over waking hours.
@@ -61,6 +64,15 @@ TOLERANCE = 2.0  # ± points of the weekly meter that still count as "on plan"
 # late night still counts toward the evening it began in, and a block may run
 # past midnight ([18, 2]).
 DAY_STARTS = 0.0
+
+# The zone the plan's hours are written in, and the one every time is shown in.
+# None is the machine's own. Times are naive wall-clock in this zone throughout.
+TZ: ZoneInfo | None = None
+
+
+def wall(ts: float | None = None) -> datetime:
+    """An epoch time (default: now) as wall-clock in the plan's zone."""
+    return datetime.fromtimestamp(time.time() if ts is None else ts, TZ).replace(tzinfo=None)
 
 
 def anchor(t: datetime) -> datetime:
@@ -94,7 +106,7 @@ CONFIG = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "c
 
 def load_config(path: Path) -> None:
     """Overlay config.toml on the defaults above. A missing file is fine."""
-    global TOLERANCE, DAY_STARTS
+    global TOLERANCE, DAY_STARTS, TZ
     try:
         cfg = tomllib.loads(path.read_text())
     except FileNotFoundError:
@@ -104,6 +116,12 @@ def load_config(path: Path) -> None:
 
     def bad(msg):
         sys.exit(f"ccpace: {path}: {msg}")
+
+    if (zone := cfg.get("timezone")) is not None:
+        try:
+            TZ = ZoneInfo(zone)
+        except (KeyError, ValueError, TypeError, OSError):  # unknown, malformed, or no tz database here
+            bad(f'timezone {zone!r} is not a zone this machine knows (expected e.g. "America/Los_Angeles")')
 
     def expand(table: str):
         # keys are day names, or the groups `weekday` / `weekend` / `all`;
@@ -139,7 +157,7 @@ def load_config(path: Path) -> None:
 
 
 # Used only when the API reports no active window (nothing used yet this week).
-FALLBACK_RESET_WEEKDAY, FALLBACK_RESET_HOUR = 5, 0  # Saturday 00:00 local
+FALLBACK_RESET_WEEKDAY, FALLBACK_RESET_HOUR = 5, 0  # Saturday 00:00 on the plan's clock
 
 # ── plumbing ─────────────────────────────────────────────────────────────────
 CREDS = Path.home() / ".claude" / ".credentials.json"
@@ -149,6 +167,7 @@ BACKOFF = 180  # seconds to leave the API alone after a 429 that doesn't say how
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 
 COLOR = sys.stdout.isatty() and "NO_COLOR" not in os.environ
+FRAME = True  # draw the box around the card; --plain turns this and COLOR off
 
 
 def c(code: str, s: str) -> str:
@@ -162,18 +181,25 @@ def yellow(s): return c("33", s)
 def red(s): return c("31", s)
 
 
-def fetch_usage(force: bool) -> tuple[dict, float, str | None]:
-    """Returns (payload, fetched_at, warning). Falls back to a stale cache."""
+# Why a reading couldn't be fetched, and the exit code --strict gives each.
+EXIT = {"expired": 2, "no_login": 3, "unreachable": 4, "rate_limited": 4}
+
+
+def fetch_usage(force: bool) -> tuple[dict | None, float | None, str, str | None]:
+    """Returns (payload, fetched_at, status, why). status is "ok" or a key of
+    EXIT; on anything but "ok" the payload is the last cached one (None if
+    there isn't one) and `why` says what went wrong."""
     cached = None
     try:
         cached = json.loads(CACHE.read_text())
     except (OSError, ValueError):
         pass
     if cached and not force and time.time() - cached["fetched_at"] < CACHE_TTL:
-        return cached["data"], cached["fetched_at"], None
+        return cached["data"], cached["fetched_at"], "ok", None
     # told to back off: asking again (even with -f) only keeps the limit alive
     if cached and (wait := cached.get("retry_at", 0) - time.time()) > 0:
-        return cached["data"], cached["fetched_at"], f"usage API is rate-limiting; trying again in {secs(wait + 1)}"
+        return (cached["data"], cached["fetched_at"], "rate_limited",
+                f"usage API is rate-limiting; trying again in {secs(wait + 1)}")
 
     try:
         token = json.loads(CREDS.read_text())["claudeAiOauth"]["accessToken"]
@@ -186,9 +212,11 @@ def fetch_usage(force: bool) -> tuple[dict, float, str | None]:
         with urllib.request.urlopen(req, timeout=15) as r:
             data = json.loads(r.read())
     except (OSError, KeyError, ValueError) as e:
+        status = "unreachable"
         if isinstance(e, urllib.error.HTTPError) and e.code == 401:
-            why = "token expired — open `claude` once to refresh it"
+            status, why = "expired", "token expired — open `claude` once to refresh it"
         elif isinstance(e, urllib.error.HTTPError) and e.code == 429:
+            status = "rate_limited"
             # hold off for as long as the API asks, or a few minutes if it doesn't say
             try:
                 wait = min(max(float(e.headers.get("Retry-After", "")), 30), 3600)
@@ -201,12 +229,10 @@ def fetch_usage(force: bool) -> tuple[dict, float, str | None]:
                 except OSError:
                     pass
         elif isinstance(e, (FileNotFoundError, KeyError)):
-            why = f"no Claude Code login found in {CREDS}"
+            status, why = "no_login", f"no Claude Code login found in {CREDS}"
         else:
             why = f"couldn't reach the usage API ({e})"
-        if cached:
-            return cached["data"], cached["fetched_at"], why
-        sys.exit(f"ccpace: {why}")
+        return (cached or {}).get("data"), (cached or {}).get("fetched_at"), status, why
 
     now = time.time()
     try:
@@ -215,12 +241,12 @@ def fetch_usage(force: bool) -> tuple[dict, float, str | None]:
     except OSError:
         pass
     record((data.get("seven_day") or {}).get("utilization") or 0.0, now, data.get("five_hour"))
-    return data, now, None
+    return data, now, "ok", None
 
 
 def local(iso: str) -> datetime:
-    """API timestamp → naive local wall-clock, snapped to the minute."""
-    dt = datetime.fromisoformat(iso).astimezone().replace(tzinfo=None)
+    """API timestamp → wall-clock in the plan's zone, snapped to the minute."""
+    dt = datetime.fromisoformat(iso).astimezone(TZ).replace(tzinfo=None)
     return (dt + timedelta(seconds=30)).replace(second=0, microsecond=0)
 
 
@@ -289,7 +315,7 @@ def readings(plan: Plan, now: datetime) -> list[tuple[datetime, float]]:
     try:
         for line in HISTORY.read_text().splitlines():
             s = json.loads(line)
-            t = datetime.fromtimestamp(s["t"])
+            t = wall(s["t"])
             if plan.start <= t <= now + timedelta(minutes=1):  # incl. the one just taken
                 out.append((t, float(s["used"])))
     except (OSError, ValueError, KeyError, TypeError):
@@ -526,13 +552,13 @@ def wrap(s: str, width: int) -> list[str]:
 
 
 def card(title: str, aside: str, lines: list[str]) -> None:
-    """Print `lines` in a box, title and aside set into the top edge. Falls
-    back to plain lines when the terminal is too narrow for the box."""
+    """Print `lines` in a box, title and aside set into the top edge. Without
+    the box under --plain, or when the terminal is too narrow for it."""
     def width(s: str) -> int:
         return len(ANSI.sub("", s))
 
     inner = max(map(width, lines)) + 2
-    if inner + 2 > shutil.get_terminal_size((10_000, 24)).columns:
+    if not FRAME or inner + 2 > shutil.get_terminal_size((10_000, 24)).columns:
         print(f"{title}  {aside}\n")
         print("\n".join(lines))
         return
@@ -662,13 +688,24 @@ def main() -> None:
     ap.add_argument("-f", "--fresh", action="store_true", help="ignore the 60s cache")
     ap.add_argument("-j", "--json", action="store_true", help="print JSON and exit")
     ap.add_argument("--used", type=float, help="what-if: pretend the weekly meter reads this")
-    ap.add_argument("--now", type=datetime.fromisoformat, help="what-if: pretend it is this local time")
-    ap.add_argument("-c", "--config", type=Path, default=CONFIG, help=f"plan file (default: {CONFIG})")
+    ap.add_argument("--now", type=datetime.fromisoformat,
+                    help="what-if: pretend it is this time, on the plan's clock (its `timezone`, else local)")
+    ap.add_argument("-c", "--config", type=Path,
+                    help=f"plan file (default: $CCPACE_CONFIG, else {CONFIG})")
     ap.add_argument("--record", action="store_true", help="log a fresh reading and exit quietly (for cron)")
     ap.add_argument("-w", "--watch", type=float, nargs="?", const=CACHE_TTL, metavar="SECS",
                     help=f"redraw every SECS seconds (default: {CACHE_TTL}); r re-fetches now, q quits")
+    ap.add_argument("--strict", action="store_true",
+                    help="if the reading can't be fetched, say why on stderr and exit non-zero instead of "
+                         "showing the cached one: 2 token expired, 3 no login, 4 unreachable or rate limited")
+    ap.add_argument("--plain", action="store_true", help="no box and no colour, whatever the terminal")
     args = ap.parse_args()
-    load_config(args.config)
+    load_config(args.config or Path(os.environ.get("CCPACE_CONFIG") or CONFIG))
+    if args.plain:
+        global COLOR, FRAME
+        COLOR = FRAME = False
+    if args.now and args.now.tzinfo:  # an offset pins the instant; put it on the plan's clock
+        args.now = args.now.astimezone(TZ).replace(tzinfo=None)
     if args.record:
         args.fresh, args.used, args.now = True, None, None
     if args.watch is None:
@@ -725,17 +762,20 @@ def secs(s: float) -> str:
 def show(args: argparse.Namespace) -> float | None:
     """Print the card (or JSON). Returns when the numbers were fetched, if they were."""
     notes, session = [], None
-    now = args.now or datetime.now()
-    reset = fetched_at = None
+    now = args.now or wall()
+    reset = fetched_at = status = why = None
     if args.used is None or args.now is None:
-        data, fetched_at, warn = fetch_usage(args.fresh)
-        if warn:
-            notes.append(f"{warn}; showing numbers from {secs(time.time() - fetched_at)} ago")
+        data, fetched_at, status, why = fetch_usage(args.fresh)
+        if why and (args.strict or data is None):  # nothing to show, or told not to show a stale one
+            print(f"ccpace: {why}", file=sys.stderr)
+            sys.exit(EXIT[status] if args.strict else 1)
+        if why:
+            notes.append(f"{why}; showing numbers from {secs(time.time() - fetched_at)} ago")
         week = data.get("seven_day") or {}
         session = data.get("five_hour")
         used = week.get("utilization") or 0.0
         if args.record:
-            sys.exit(1 if warn else 0)
+            sys.exit(1 if why else 0)
         if week.get("resets_at"):
             reset = local(week["resets_at"])
     if args.used is not None:
@@ -753,8 +793,11 @@ def show(args: argparse.Namespace) -> float | None:
     speed = speeds(float(used), now, plan, a["bedtime_target"])
 
     if args.json:
+        # fetch: "ok", or why the reading shown is a cached one (null in a full what-if).
+        # fetched_at carries its UTC offset; the other times are the plan's wall-clock
+        stamp = fetched_at and datetime.fromtimestamp(fetched_at, TZ).astimezone(TZ)
         out = a | {"now": now, "resets_at": reset, "session": (session or {}).get("utilization"),
-                   "notes": notes, "speed": speed}
+                   "notes": notes, "speed": speed, "fetch": status, "fetched_at": stamp, "stale": bool(why)}
         print(json.dumps(out, indent=2, default=datetime.isoformat))
         return fetched_at
     render(a, now, plan, session, notes, speed)

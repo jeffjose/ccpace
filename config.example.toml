@@ -2,6 +2,11 @@
 # Everything here is optional. With no config, every day gets an equal share
 # of the week, spread flat from 9am to midnight.
 
+# The zone the hours below are written in, and the one every time is shown in.
+# Default: the machine's own. Set it if ccpace also runs somewhere on another
+# clock (a server on UTC, say), so the plan means the same thing there.
+# timezone = "America/Los_Angeles"
+
 # ± points of the weekly meter that still count as "on plan"
 tolerance = 2
 
