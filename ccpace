@@ -145,6 +145,7 @@ FALLBACK_RESET_WEEKDAY, FALLBACK_RESET_HOUR = 5, 0  # Saturday 00:00 local
 CREDS = Path.home() / ".claude" / ".credentials.json"
 CACHE = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "ccpace" / "usage.json"
 CACHE_TTL = 60
+BACKOFF = 180  # seconds to leave the API alone after a 429 that doesn't say how long
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 
 COLOR = sys.stdout.isatty() and "NO_COLOR" not in os.environ
@@ -170,6 +171,9 @@ def fetch_usage(force: bool) -> tuple[dict, float, str | None]:
         pass
     if cached and not force and time.time() - cached["fetched_at"] < CACHE_TTL:
         return cached["data"], cached["fetched_at"], None
+    # told to back off: asking again (even with -f) only keeps the limit alive
+    if cached and (wait := cached.get("retry_at", 0) - time.time()) > 0:
+        return cached["data"], cached["fetched_at"], f"usage API is rate-limiting; trying again in {secs(wait + 1)}"
 
     try:
         token = json.loads(CREDS.read_text())["claudeAiOauth"]["accessToken"]
@@ -184,6 +188,18 @@ def fetch_usage(force: bool) -> tuple[dict, float, str | None]:
     except (OSError, KeyError, ValueError) as e:
         if isinstance(e, urllib.error.HTTPError) and e.code == 401:
             why = "token expired — open `claude` once to refresh it"
+        elif isinstance(e, urllib.error.HTTPError) and e.code == 429:
+            # hold off for as long as the API asks, or a few minutes if it doesn't say
+            try:
+                wait = min(max(float(e.headers.get("Retry-After", "")), 30), 3600)
+            except ValueError:
+                wait = BACKOFF
+            why = f"usage API is rate-limiting; trying again in {secs(wait)}"
+            if cached:
+                try:
+                    CACHE.write_text(json.dumps(cached | {"retry_at": time.time() + wait}))
+                except OSError:
+                    pass
         elif isinstance(e, (FileNotFoundError, KeyError)):
             why = f"no Claude Code login found in {CREDS}"
         else:
@@ -636,7 +652,7 @@ def render(a: dict, now: datetime, plan: Plan, session: dict | None, notes: list
     if any(r.get("rough") for r in speed):
         p(dim("  ~ interpolated across a gap in the history"))
     for n in notes:
-        p(dim(f"  ! {n}"))
+        out.extend(dim(f"  {part}") for part in wrap(f"! {n}", W + 53))
 
     card(bold("Claude Code"), dim(f"{clock(now)} · week resets {clock(plan.reset)} ({span(plan.reset - now)})"), out)
 
@@ -656,7 +672,8 @@ def main() -> None:
     if args.record:
         args.fresh, args.used, args.now = True, None, None
     if args.watch is None:
-        return show(args)
+        show(args)
+        return
     if args.json or args.record:
         ap.error("-w can't be combined with --json or --record")
     if args.watch <= 0:
@@ -675,37 +692,45 @@ def main() -> None:
             # draw into a buffer first so the screen never sits blank during a fetch
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):
-                show(args)
-                print(dim(f"  every {args.watch:g}s · {hint}"))
+                fetched_at = show(args)
             sys.stdout.write("\033[H\033[2J" + buf.getvalue())
-            sys.stdout.flush()
             args.fresh = fresh
-            if not keys:
-                time.sleep(args.watch)
-                continue
             due = time.monotonic() + args.watch
-            while (left := due - time.monotonic()) > 0 and select.select([fd], [], [], left)[0]:
-                key = os.read(fd, 1).lower()
-                if key in (b"q", b""):
-                    return
-                if key == b"r":
-                    args.fresh = True  # this one redraw skips the cache
-                    break
+            # the footer ticks once a second: how old the numbers are, and when the next look is
+            while (left := due - time.monotonic()) > 0:
+                age = f"updated {secs(time.time() - fetched_at)} ago · " if fetched_at else ""
+                sys.stdout.write("\r\033[K" + dim(f"  {age}next in {secs(left + 1)} · {hint}"))
+                sys.stdout.flush()
+                if not keys:
+                    time.sleep(min(left, 1))
+                elif select.select([fd], [], [], min(left, 1))[0]:
+                    key = os.read(fd, 1).lower()
+                    if key in (b"q", b""):
+                        return
+                    if key == b"r":
+                        args.fresh = True  # this one redraw skips the cache
+                        break
     except KeyboardInterrupt:
-        print()
+        pass
     finally:
+        print()  # step off the footer line
         if keys:
             termios.tcsetattr(fd, termios.TCSADRAIN, saved)
 
 
-def show(args: argparse.Namespace) -> None:
+def secs(s: float) -> str:
+    return f"{int(s)}s" if s < 120 else span(timedelta(seconds=s))
+
+
+def show(args: argparse.Namespace) -> float | None:
+    """Print the card (or JSON). Returns when the numbers were fetched, if they were."""
     notes, session = [], None
     now = args.now or datetime.now()
-    reset = None
+    reset = fetched_at = None
     if args.used is None or args.now is None:
         data, fetched_at, warn = fetch_usage(args.fresh)
         if warn:
-            notes.append(f"{warn}; showing numbers from {span(timedelta(seconds=time.time() - fetched_at))} ago")
+            notes.append(f"{warn}; showing numbers from {secs(time.time() - fetched_at)} ago")
         week = data.get("seven_day") or {}
         session = data.get("five_hour")
         used = week.get("utilization") or 0.0
@@ -731,8 +756,9 @@ def show(args: argparse.Namespace) -> None:
         out = a | {"now": now, "resets_at": reset, "session": (session or {}).get("utilization"),
                    "notes": notes, "speed": speed}
         print(json.dumps(out, indent=2, default=datetime.isoformat))
-        return
+        return fetched_at
     render(a, now, plan, session, notes, speed)
+    return fetched_at
 
 
 if __name__ == "__main__":
