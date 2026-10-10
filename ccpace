@@ -569,7 +569,8 @@ def card(title: str, aside: str, lines: list[str]) -> None:
     print(dim(f"╰{'─' * inner}╯"))
 
 
-def render(a: dict, now: datetime, plan: Plan, session: dict | None, notes: list[str], speed: list[dict]) -> None:
+def render(a: dict, now: datetime, plan: Plan, session: dict | None, notes: list[str], speed: list[dict],
+           fetched_at: float | None = None) -> None:
     W = 25
     used, exp, delta = a["used"], a["expected"], a["delta"]
     block = "tonight" if a["evening"] else "today"
@@ -670,17 +671,22 @@ def render(a: dict, now: datetime, plan: Plan, session: dict | None, notes: list
         times = ("~" if r["rough"] else "") + f"{s:.1f}×"
         p(f"  {style(f'{r['label']:<9}')}{bar}  {tone(bold(f'{times:>5}'))} {tone(f'{word:<7}')} {style(cols)}")
     p("")
-    p(dim(f"  today and lately: vs the pace that lands {block}'s {a['bedtime_target']:.0f}% · past days: vs the plan"))
-    if a["day_start_note"]:
-        p(dim(f"  today's start: {a['day_start_note']}"))
-    if any(r.get("thin") for r in speed):
-        p(dim("  ? projected from a single tick of the meter"))
-    if any(r.get("rough") for r in speed):
-        p(dim("  ~ interpolated across a gap in the history"))
+    p(dim(f"  today, lately: vs pace to {block}'s {a['bedtime_target']:.0f}% · days: vs plan"))
+    # one line of caveats, only the ones in play
+    marks = [text for on, text in (
+        (any(r.get("rough") for r in speed), "~ gap in history"),
+        (any(r.get("thin") for r in speed), "? single tick"),
+        (a["day_start_note"], f"today {a['day_start_note']}"),
+    ) if on]
+    if marks:
+        p(dim("  " + " · ".join(marks)))
     for n in notes:
         out.extend(dim(f"  {part}") for part in wrap(f"! {n}", W + 53))
 
-    card(bold("Claude Code"), dim(f"{clock(now)} · week resets {clock(plan.reset)} ({span(plan.reset - now)})"), out)
+    # how old the reading is, so a single run says what a watch footer would
+    age = "" if fetched_at is None else "updated now · " if (old := time.time() - fetched_at) < 60 else \
+        f"updated {span(timedelta(seconds=old))} ago · "
+    card(bold("Claude Code"), dim(f"{clock(now)} · {age}resets {clock(plan.reset)} ({span(plan.reset - now)})"), out)
 
 
 def main() -> None:
@@ -800,7 +806,7 @@ def show(args: argparse.Namespace) -> float | None:
                    "notes": notes, "speed": speed, "fetch": status, "fetched_at": stamp, "stale": bool(why)}
         print(json.dumps(out, indent=2, default=datetime.isoformat))
         return fetched_at
-    render(a, now, plan, session, notes, speed)
+    render(a, now, plan, session, notes, speed, fetched_at)
     return fetched_at
 
 
