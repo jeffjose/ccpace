@@ -5,13 +5,6 @@ Am I over or under on Claude Code this week — and what should I do about it to
 ```
 Claude Code  Wed 8:00 PM · week resets Sat 12:00 AM (2d 4h)
 
- [UNDER by 7.2%]  on pace   over
-  Go harder. 14% left for tonight over 6.0h (2.3%/h) — 2.1x the planned pace.
-
-  meter                                               used  expect
-  week     ████████████████░┃░░░░░░░   -7.2 under      62%     69%
-  today    ███████████░░░░░░░┃░░░░░░    14% left       11%     18%   of 25%
-
   speed    ◀ slow   on pace   fast ▶                  used  budget  meter target
   Sat      ░░░░░░░░░███│░░░░░░░░░░░░   0.7× slow        15      20     15     20
   Sun      ░░░░░░░░████│░░░░░░░░░░░░   0.7× slow        14      20     28     40
@@ -21,15 +14,27 @@ Claude Code  Wed 8:00 PM · week resets Sat 12:00 AM (2d 4h)
   Thu      ░░░░░░░░░░░░│░░░░░░░░░░░░                     ·      12      ·     88
   Fri      ░░░░░░░░░░░░│░░░░░░░░░░░░                     ·      12      ·    100
 
+  meter                                               used  expect
+  week     ████████████████░┃░░░░░░░   -7.2 under      62%     69%
+  today    ███████████░░░░░░░┃░░░░░░    14% left       11%     18%   of 25%
+
   lately                                              used  budget at reset      full
-  last 15m ░░░░░███████│░░░░░░░░░░░░   0.4× slow       0.2     0.6     86%?
-  last 1h  ░░░░░███████│░░░░░░░░░░░░   0.4× slow       0.9     2.1     86%?
   last 6h  ░░░░░░░░░░░█┃░░░░░░░░░░░░   0.9× on pace    5.2     5.9     116%   Fri 4PM
+  last 1h  ░░░░░███████│░░░░░░░░░░░░   0.4× slow       0.9     2.1     86%?
+  last 15m ░░░░░███████│░░░░░░░░░░░░   0.4× slow       0.2     0.6     86%?
+
+  today, lately: vs pace to tonight's 76% · days: vs plan
+  ? single tick
+
+ [UNDER by 7.2%]  on pace   over
+  Go harder. 14% left for tonight over 6.0h (2.3%/h) — 2.1x the planned pace.
 ```
 
 The weekly meter only means something next to where it *should* be by now.
 ccpace reads your live usage, compares it to a plan of how you intend to spend
-the week, and tells you whether to ease off or push. In a terminal the card is
+the week, and tells you whether to ease off or push. The card reads from the
+bottom up: the verdict sits last, nearest the prompt, with the last few hours,
+the meters and the week's days above it. In a terminal the card is
 boxed and coloured; the sample above is `--plain`.
 
 ## Install

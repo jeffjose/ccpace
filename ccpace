@@ -674,20 +674,51 @@ def render(a: dict, now: datetime, plan: Plan, session: dict | None, notes: list
         p(f"  {dim(f'{name:<9}')}{''.join(cells)}  {tone(f'{gist:<14}')}{bold(f'{used:>6}')}{dim(f'{expect:>8}')}"
           + (f"   {note}" if note else ""))
 
-    # the verdict first: under · on pace · over, with the current one lit up
-    state = "on pace" if abs(delta) <= TOLERANCE else "over" if delta > 0 else "under"
-    # the amount lives inside the lit label so it can't be read against a neighbour
-    lit = {"under": "1;7;32", "on pace": "1;7;32", "over": "1;7;33"}
-    label = state.upper()
-    if abs(delta) >= 0.5:
-        label += f" by {abs(delta):.1f}%" if state != "on pace" else f" · {abs(delta):.1f}% {'over' if delta > 0 else 'under'}"
-    p(" " + " ".join(
-        (c(lit[s], f" {label} ") if COLOR else f"[{label}]") if s == state else dim(f" {s} ")
-        for s in lit))
-    for line in advice(a):
-        out.extend(f"  {part}" for part in wrap(line, W + 53))  # as wide as the tables below
+    # Laid out to be read from the bottom up, which is where a terminal leaves
+    # the eye: the week's days first, then the meters, then the last few hours,
+    # and the verdict last.
+
+    # speed: each stretch as a bar off its budget — slow grows left, fast grows
+    # right, and the right edge is 2× the budget. The columns after it are what
+    # moved vs that budget, and where the meter closed vs its target.
+    H = W // 2
+
+    def heading(name: str, scale: str, *cols: str) -> str:
+        return dim(f"  {name:<9}{scale:<{W}}{'':16}{'used':>6}{'budget':>8}{''.join(cols)}")
+
+    def stretch(r: dict) -> None:
+        style = bold if r.get("today") else dim
+        s, ahead = r["speed"], r.get("ahead")
+        cols = (f"{'·' if ahead else pct(r['used']):>6}{pct(r['budget']):>8}"
+                + (f"{'·' if ahead else format(r['meter'], '.0f'):>7}{r['target']:>7.0f}" if "target" in r else ""))
+        if "ends" in r:
+            unsure = "?" if r["thin"] else ""
+            ends = f"{min(r['ends'], 999):.0f}%{unsure}"
+            cols += (red if r["ends"] > 100 + TOLERANCE else green)(f"{ends:>9}")
+            if "full_at" in r:
+                # to the minute when it's today, else the day and hour are enough
+                near = r["full_at"].date() == now.date()
+                cols += red((f"{r['full_at']:{'%-I:%M%p' if near else '%a %-I%p'}}" + unsure).rjust(10))
+        if s is None:
+            p(f"  {style(f'{r['label']:<9}')}{dim('░' * H + '│' + '░' * H)}{'':16}{style(cols)}")
+            return
+        n = min(round(abs(s - 1) * H), H)
+        word = "on pace" if abs(s - 1) <= ON_PACE else "slow" if s < 1 else "fast"
+        tone = red if word == "fast" else green
+        left, right = (n, 0) if s < 1 else (0, n)
+        bar = (dim("░" * (H - left)) + tone("█" * left) + tone("┃" if word == "on pace" else "│")
+               + tone("█" * right) + dim("░" * (H - right)))
+        times = ("~" if r["rough"] else "") + f"{s:.1f}×"
+        p(f"  {style(f'{r['label']:<9}')}{bar}  {tone(bold(f'{times:>5}'))} {tone(f'{word:<7}')} {style(cols)}")
+
+    # the days of the week
+    p(heading("speed", f"{'◀ slow':<{H - 3}}{'on pace':^7}{'fast ▶':>{H - 3}}", f"{'meter':>7}", f"{'target':>7}"))
+    for r in speed:
+        if not r.get("recent"):
+            stretch(r)
     p("")
 
+    state = "on pace" if abs(delta) <= TOLERANCE else "over" if delta > 0 else "under"
     p(dim(f"  {'meter':<9}{'':{W}}{'':16}{'used':>6}{'expect':>8}"))
     meter("week", used / 100, yellow if delta > TOLERANCE else green, exp / 100,
           f"{delta:+5.1f} {state}", f"{used:.0f}%", f"{exp:.0f}%")
@@ -714,45 +745,11 @@ def render(a: dict, now: datetime, plan: Plan, session: dict | None, notes: list
               used=f"{busy:.0f}%", note=note)
     p("")
 
-    # speed: each stretch as a bar off its budget — slow grows left, fast grows
-    # right, and the right edge is 2× the budget. The columns after it are what
-    # moved vs that budget, and where the meter closed vs its target.
-    H = W // 2
-
-    def heading(name: str, scale: str, *cols: str) -> str:
-        return dim(f"  {name:<9}{scale:<{W}}{'':16}{'used':>6}{'budget':>8}{''.join(cols)}")
-
-    p(heading("speed", f"{'◀ slow':<{H - 3}}{'on pace':^7}{'fast ▶':>{H - 3}}", f"{'meter':>7}", f"{'target':>7}"))
-    recent = [r for r in speed if r.get("recent")]
-    for r in (*(r for r in speed if not r.get("recent")), None, *recent):  # the days, then the last few hours
-        if r is None:
-            # these project the week: where the meter ends at that pace, and when it would fill
-            p("")
-            p(heading("lately", "", f"{'at reset':>9}", f"{'full':>10}"))
-            continue
-        style = bold if r.get("today") else dim
-        s, ahead = r["speed"], r.get("ahead")
-        cols = (f"{'·' if ahead else pct(r['used']):>6}{pct(r['budget']):>8}"
-                + (f"{'·' if ahead else format(r['meter'], '.0f'):>7}{r['target']:>7.0f}" if "target" in r else ""))
-        if "ends" in r:
-            unsure = "?" if r["thin"] else ""
-            ends = f"{min(r['ends'], 999):.0f}%{unsure}"
-            cols += (red if r["ends"] > 100 + TOLERANCE else green)(f"{ends:>9}")
-            if "full_at" in r:
-                # to the minute when it's today, else the day and hour are enough
-                near = r["full_at"].date() == now.date()
-                cols += red((f"{r['full_at']:{'%-I:%M%p' if near else '%a %-I%p'}}" + unsure).rjust(10))
-        if s is None:
-            p(f"  {style(f'{r['label']:<9}')}{dim('░' * H + '│' + '░' * H)}{'':16}{style(cols)}")
-            continue
-        n = min(round(abs(s - 1) * H), H)
-        word = "on pace" if abs(s - 1) <= ON_PACE else "slow" if s < 1 else "fast"
-        tone = red if word == "fast" else green
-        left, right = (n, 0) if s < 1 else (0, n)
-        bar = (dim("░" * (H - left)) + tone("█" * left) + tone("┃" if word == "on pace" else "│")
-               + tone("█" * right) + dim("░" * (H - right)))
-        times = ("~" if r["rough"] else "") + f"{s:.1f}×"
-        p(f"  {style(f'{r['label']:<9}')}{bar}  {tone(bold(f'{times:>5}'))} {tone(f'{word:<7}')} {style(cols)}")
+    # the last few hours, longest first so the freshest sits nearest the verdict.
+    # These project the week: where the meter ends at that pace, and when it would fill
+    p(heading("lately", "", f"{'at reset':>9}", f"{'full':>10}"))
+    for r in reversed([r for r in speed if r.get("recent")]):
+        stretch(r)
     p("")
     p(dim(f"  today, lately: vs pace to {block}'s {a['bedtime_target']:.0f}% · days: vs plan"))
     # one line of caveats, only the ones in play
@@ -765,6 +762,19 @@ def render(a: dict, now: datetime, plan: Plan, session: dict | None, notes: list
         p(dim("  " + " · ".join(marks)))
     for n in notes:
         out.extend(dim(f"  {part}") for part in wrap(f"! {n}", W + 53))
+    p("")
+
+    # the verdict last: under · on pace · over, with the current one lit up
+    # the amount lives inside the lit label so it can't be read against a neighbour
+    lit = {"under": "1;7;32", "on pace": "1;7;32", "over": "1;7;33"}
+    label = state.upper()
+    if abs(delta) >= 0.5:
+        label += f" by {abs(delta):.1f}%" if state != "on pace" else f" · {abs(delta):.1f}% {'over' if delta > 0 else 'under'}"
+    p(" " + " ".join(
+        (c(lit[s], f" {label} ") if COLOR else f"[{label}]") if s == state else dim(f" {s} ")
+        for s in lit))
+    for line in advice(a):
+        out.extend(f"  {part}" for part in wrap(line, W + 53))  # as wide as the tables above
 
     # how old the reading is, so a single run says what a watch footer would
     age = "" if fetched_at is None else "updated now · " if (old := time.time() - fetched_at) < 60 else \
