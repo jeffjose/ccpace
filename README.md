@@ -34,7 +34,8 @@ boxed and coloured; the sample above is `--plain`.
 
 ## Install
 
-Needs [uv](https://docs.astral.sh/uv/) and a logged-in Claude Code. No dependencies.
+Needs [uv](https://docs.astral.sh/uv/) and a logged-in Claude Code. uv fetches
+the one dependency, Pillow, on the first run; it is only loaded for `--png`.
 
 ```sh
 git clone https://github.com/jeffjose/ccpace && ln -s "$PWD/ccpace/ccpace" ~/.local/bin/ccpace
@@ -48,6 +49,7 @@ ccpace -f           skip the 60s cache and re-fetch
 ccpace -w 30        redraw every 30s (bare -w: every 60); r re-fetches now, q quits
 ccpace -j           print JSON and exit (scripting / statusline)
 ccpace --plain      no box and no colour, whatever the terminal
+ccpace --png FILE   write the card as an image (- for stdout)
 ccpace --strict     exit non-zero, with the reason, rather than show a cached reading
 ccpace -c FILE      use a different plan file
 ccpace --record     log a reading and exit quietly (for cron)
@@ -192,5 +194,16 @@ insist on a request. Without `--strict` and with no cached reading at all,
 ccpace exits 1 as before.
 
 `--plain` prints the card with no box and no colour regardless of the
-terminal, which is the form to paste or post (about 1,700 characters, against
+terminal, which is the form to paste or post (about 1,600 characters, against
 roughly 5,000 for the boxed, coloured card).
+
+`--png FILE` writes the card as an image instead: the same content, in
+colour, about 1500 pixels wide. Nothing is printed. It combines with
+`--strict`, in which case a failed fetch exits before any file is written.
+It needs a monospace font on the machine — DejaVu Sans Mono is looked for
+first (`fonts-dejavu-core` on Debian and Ubuntu). To post it to a Discord
+webhook:
+
+```sh
+ccpace --strict --png card.png && curl -F "file1=@card.png" "$DISCORD_WEBHOOK_URL"
+```

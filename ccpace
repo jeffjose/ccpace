@@ -1,6 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
+# dependencies = ["pillow"]  # --png only; imported there and nowhere else
 # ///
 """Am I over or under on Claude Code this week? — and what to do about it tonight.
 
@@ -9,6 +10,7 @@
     ccpace -w 30        redraw every 30 seconds (bare -w: every 60); r re-fetches now, q quits
     ccpace -j           print JSON and exit (scripting / statusline)
     ccpace --plain      the card with no box and no colour (for pasting or posting)
+    ccpace --png FILE   the card as an image (for posting where text won't do)
     ccpace --strict     exit non-zero, with the reason, rather than show a cached reading
     ccpace --used 70 --now 2026-10-07T14:00    what-if, no network
 
@@ -569,6 +571,87 @@ def card(title: str, aside: str, lines: list[str]) -> None:
     print(dim(f"╰{'─' * inner}╯"))
 
 
+# The card as a picture, for places a terminal can't go. A dark terminal's palette.
+PAPER, EDGE, TRACK = "#0d1117", "#30363d", "#21262d"
+INK = {"": "#c9d1d9", "2": "#8b949e", "31": "#f85149", "32": "#3fb950", "33": "#d29922"}
+
+
+# Monospace faces to try, as (regular, bold) file names Pillow finds in the system's font folders.
+FONTS = (("DejaVuSansMono.ttf", "DejaVuSansMono-Bold.ttf"), ("LiberationMono-Regular.ttf", "LiberationMono-Bold.ttf"),
+         ("Menlo.ttc", "Menlo.ttc"), ("consola.ttf", "consolab.ttf"))
+
+
+def png(text: str, out) -> None:
+    """The card as printed, ANSI and all → a PNG written to `out` (a path or a
+    binary stream). Bars and rules are drawn as shapes and every character
+    sits on a fixed grid, so nothing depends on how a font spaces odd glyphs."""
+    try:
+        from PIL import Image, ImageDraw, ImageFont  # only this path pays for the import
+    except ImportError:
+        sys.exit("ccpace: --png needs Pillow; run ccpace through uv, which installs it")
+    Z = 2  # twice life size, so it stays sharp when a chat client scales it
+    for names in FONTS:
+        try:
+            plain, heavy = (ImageFont.truetype(name, 14 * Z) for name in names)
+            break
+        except OSError:
+            continue
+    else:
+        sys.exit("ccpace: --png needs a monospace font; install DejaVu Sans Mono (fonts-dejavu-core)")
+    CW, LH, PAD = plain.getlength("0"), 20 * Z, 20 * Z
+    shapes, glyphs, width = [], [], 0
+    lines = text.rstrip("\n").split("\n")
+
+    def rect(x: float, y: float, w: float, h: float, fill: str, r: float = 0) -> None:
+        shapes.append(((round(x), round(y), round(x + w) - 1, round(y + h) - 1), fill, r))
+
+    for row, line in enumerate(lines):
+        y, col = PAD + row * LH, 0
+        strong = faint = lit = False
+        hue = ""
+        for part in re.split(r"(\033\[[0-9;]*m)", line):
+            if part.startswith("\033"):
+                for code in part[2:-1].split(";"):
+                    if code in ("", "0"):
+                        strong = faint = lit = False
+                        hue = ""
+                    elif code in ("1", "2", "7"):
+                        strong, faint, lit = strong or code == "1", faint or code == "2", lit or code == "7"
+                    else:
+                        hue = code
+                continue
+            ink = INK.get(hue or ("2" if faint else ""), INK[""])
+            if lit:  # reverse video: a filled badge with the text knocked out
+                rect(PAD + col * CW, y + Z, len(part) * CW, LH - 2 * Z, ink, 3 * Z)
+                ink = PAPER
+            for i, ch in enumerate(part, col):
+                x = PAD + i * CW
+                if ch == "█":
+                    rect(x, y + 4 * Z, CW, LH - 8 * Z, ink)
+                elif ch == "░":
+                    rect(x, y + 4 * Z, CW, LH - 8 * Z, TRACK)
+                elif ch in "│┃":
+                    thick = (3 if ch == "┃" else 1.2) * Z
+                    rect(x + (CW - thick) / 2, y + Z, thick, LH - 2 * Z, INK[""] if ch == "┃" and not hue else ink)
+                elif ch != " ":
+                    glyphs.append((x, y + 14.5 * Z, ch, ink, heavy if strong else plain))
+            col += len(part)
+        width = max(width, col)
+
+    w, h = round(width * CW) + 2 * PAD, len(lines) * LH + 2 * PAD
+    image = Image.new("RGBA", (w, h))  # clear outside the rounded corners
+    draw = ImageDraw.Draw(image)
+    draw.rounded_rectangle((0, 0, w - 1, h - 1), 10 * Z, fill=PAPER, outline=EDGE, width=Z)
+    for box, fill, r in shapes:
+        draw.rounded_rectangle(box, r, fill=fill)
+    for x, y, ch, ink, font in glyphs:
+        draw.text((x, y), ch, font=font, fill=ink, anchor="ls")
+    try:
+        image.save(out, "PNG")
+    except OSError as e:
+        sys.exit(f"ccpace: can't write the image: {e}")
+
+
 def render(a: dict, now: datetime, plan: Plan, session: dict | None, notes: list[str], speed: list[dict],
            fetched_at: float | None = None) -> None:
     W = 25
@@ -626,7 +709,7 @@ def render(a: dict, now: datetime, plan: Plan, session: dict | None, notes: list
         gist = note = ""
         if session.get("resets_at"):
             r = local(session["resets_at"])
-            gist, note = f"resets in {span(r - now)}", dim(f"at {r:%-I:%M %p}")
+            gist, note = f"resets {span(r - now)}", dim(f"at {r:%-I:%M %p}")
         meter("session", busy / 100, red if busy >= 90 else yellow if busy >= 75 else green, gist=gist,
               used=f"{busy:.0f}%", note=note)
     p("")
@@ -705,15 +788,27 @@ def main() -> None:
                     help="if the reading can't be fetched, say why on stderr and exit non-zero instead of "
                          "showing the cached one: 2 token expired, 3 no login, 4 unreachable or rate limited")
     ap.add_argument("--plain", action="store_true", help="no box and no colour, whatever the terminal")
+    ap.add_argument("--png", metavar="FILE",
+                    help="write the card as a PNG image to FILE (- for stdout) instead of printing it")
     args = ap.parse_args()
     load_config(args.config or Path(os.environ.get("CCPACE_CONFIG") or CONFIG))
+    global COLOR, FRAME
     if args.plain:
-        global COLOR, FRAME
         COLOR = FRAME = False
     if args.now and args.now.tzinfo:  # an offset pins the instant; put it on the plan's clock
         args.now = args.now.astimezone(TZ).replace(tzinfo=None)
     if args.record:
         args.fresh, args.used, args.now = True, None, None
+    if args.png:
+        if args.plain or args.json or args.record or args.watch is not None:
+            ap.error("--png can't be combined with --plain, --json, --record or -w")
+        # the coloured card, unboxed: png() draws its own frame
+        COLOR, FRAME = True, False
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            show(args)
+        png(buf.getvalue(), sys.stdout.buffer if args.png == "-" else args.png)
+        return
     if args.watch is None:
         show(args)
         return
