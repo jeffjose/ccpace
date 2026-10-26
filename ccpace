@@ -5,7 +5,7 @@
 # ///
 """Am I over or under on Claude Code this week? — and what to do about it tonight.
 
-    ccpace              the card: the meter, the plan, the advice, and the speed
+    ccpace              the card: the week, today, the speed, and what to do now
     ccpace -f           skip the 60s cache and re-fetch
     ccpace -w 30        redraw every 30 seconds (bare -w: every 60); r re-fetches now, q quits
     ccpace -j           print JSON and exit (scripting / statusline)
@@ -475,58 +475,106 @@ def analyse(used: float, now: datetime, plan: Plan, start: float | None = None, 
     }
 
 
-def advice(a: dict) -> list[str]:
+def verdict(a: dict) -> dict:
+    """What to do now, as a headline and the reason for it. `tone` is go / ok
+    (green), slow (amber) or stop (red); `more` holds any follow-up lines."""
     block = "tonight" if a["evening"] else "today"
     normal = "a normal evening" if a["evening"] else "a normal day"
     room, mult, delta = a["room_today"], a["multiplier"], a["delta"]
-    out = []
 
     if room <= 0:
         past = f"already {-room:.0f}% past" if room <= -0.5 else "right at"
-        out.append(red(f"Stop for today — you're {past} {block}'s bedtime target ({a['bedtime_target']:.0f}%)."))
+        more = []
         if not a["week_over"]:
             left = a["tomorrow_target"] - a["used"]
-            out.append(f"Anything more comes out of tomorrow, which is down to {max(left, 0):.0f}% "
-                       f"(normally {a['tomorrow_nominal']:.0f}%).")
-        return out
+            more.append(f"Anything more comes out of tomorrow, which is down to {max(left, 0):.0f}% "
+                        f"(normally {a['tomorrow_nominal']:.0f}%).")
+        return {"tone": "stop", "head": "Stop for today.",
+                "body": f"You're {past} {block}'s bedtime target ({a['bedtime_target']:.0f}%).", "more": more}
 
-    x = f"{mult:.1f}x" if mult is not None else "—"
+    x = f"{mult:.1f}×" if mult is not None else "—"
     if a["in_prime"]:
         rate = room / a["hours_left"] if a["hours_left"] > 0 else 0
-        head = f"{room:.0f}% left for {block} over {a['hours_left']:.1f}h ({rate:.1f}%/h) — {x} the planned pace."
+        by = "midnight" if a["eod"].hour == a["eod"].minute == 0 else \
+            f"{a['eod']:%-I%p}".replace("AM", "am").replace("PM", "pm")
+        body = f"Use {room:.0f}% by {by} — {rate:.1f}%/h, {x} the planned pace."
         if mult is None:  # the plan expects nothing more today (day off, or the last minutes)
-            out.append(green(f"Nothing more planned for today — {room:.0f}% of slack before the bedtime target."))
-        elif delta > TOLERANCE:
-            out.append(yellow("Slow down. ") + head)
-        elif delta < -TOLERANCE:
-            out.append(green("Go harder. ") + head)
-        else:
-            out.append(green("On plan. ") + head)
-    else:
-        usual = a["prime_nominal"]
-        budget = f"{room:.0f}% vs the usual {usual:.0f}%"
-        # what's left for the prime block if the pre-prime trickle carries on as planned
-        keep = max(room - a["trickle_left"], 0)
-        keep_x = f"{keep / usual:.1f}x" if usual > 0.05 else "—"
-        trickling = a["trickle_left"] > 0.3
+            return {"tone": "ok", "head": "Nothing more planned.",
+                    "body": f"{room:.0f}% of slack before the bedtime target.", "more": []}
         if delta > TOLERANCE:
-            out.append(yellow(f"Take it easy until {a['prime_from']:%-I%p}. ".replace("AM", "am").replace("PM", "pm"))
-                       + f"Stop now and {block} is {x} {normal} ({budget}).")
-            if trickling:
-                out.append(f"Keep trickling at the planned rate and it drops to {keep_x}.")
-        elif delta < -TOLERANCE:
-            out.append(green(f"Quiet so far — you can go {x} {block}") + f" ({budget}).")
-        elif trickling:
-            out.append(green("On plan. ") + f"Keep the daytime trickle ({a['trickle_left']:.0f}%) and {block} is "
-                       f"{keep_x} {normal} ({keep:.0f}% vs the usual {usual:.0f}%).")
-        else:
-            out.append(green("On plan. ") + f"{block.capitalize()} is {x} {normal} ({budget}).")
-    return out
+            return {"tone": "slow", "head": "Slow down.", "body": body, "more": []}
+        if delta < -TOLERANCE:
+            return {"tone": "go", "head": "Go harder.", "body": body, "more": []}
+        return {"tone": "ok", "head": "On plan.", "body": body, "more": []}
+
+    usual = a["prime_nominal"]
+    budget = f"{room:.0f}% vs the usual {usual:.0f}%"
+    # what's left for the prime block if the pre-prime trickle carries on as planned
+    keep = max(room - a["trickle_left"], 0)
+    keep_x = f"{keep / usual:.1f}×" if usual > 0.05 else "—"
+    trickling = a["trickle_left"] > 0.3
+    if delta > TOLERANCE:
+        until = f"{a['prime_from']:%-I%p}".replace("AM", "am").replace("PM", "pm")
+        more = [f"Keep trickling at the planned rate and it drops to {keep_x}."] if trickling else []
+        return {"tone": "slow", "head": f"Take it easy until {until}.",
+                "body": f"Stop now and {block} is {x} {normal} ({budget}).", "more": more}
+    if delta < -TOLERANCE:
+        return {"tone": "go", "head": "Quiet so far.", "body": f"You can go {x} {block} ({budget}).", "more": []}
+    if trickling:
+        return {"tone": "ok", "head": "On plan.", "body": f"Keep the daytime trickle ({a['trickle_left']:.0f}%) "
+                f"and {block} is {keep_x} {normal} ({keep:.0f}% vs the usual {usual:.0f}%).", "more": []}
+    return {"tone": "ok", "head": "On plan.", "body": f"{block.capitalize()} is {x} {normal} ({budget}).", "more": []}
+
+
+def facts(a: dict, now: datetime, plan: Plan, session: dict | None, speed: list[dict]) -> dict:
+    """Everything either card shows, worked out once: the verdict, the speeds
+    as %/h, the clocks, and the week day by day."""
+    recent = {r["label"].removeprefix("last "): r for r in speed if r.get("recent")}
+
+    def per_hour(r: dict) -> float:
+        hours = (r["to"] - r["from"]) / timedelta(hours=1)
+        return r["used"] / hours if hours > 0 else 0.0
+
+    left = a["hours_left"]
+    # `need` lands tonight's target from here; `planned` is what the plan itself
+    # has left for today, spread over the same hours
+    need = a["room_today"] / left if left > 0.05 and a["room_today"] > 0 else None
+    planned = (a["bedtime_target"] - a["expected"]) / left if left > 0.05 else None
+    lately = [{"name": n, "rate": per_hour(r), "rough": r["rough"], "thin": r.get("thin", False)}
+              for n, r in recent.items()]
+    # where the week ends at the pace of the last hour (or six, if the hour had no plan to measure by)
+    pace = next((r for r in (recent.get("1h"), recent.get("6h")) if r and "ends" in r), None)
+
+    days = []
+    for r in (r for r in speed if not r.get("recent")):
+        share = r["target"] - plan.at(r["from"])
+        used = None if r.get("ahead") else r["used"]
+        days.append({"label": r["label"], "from": r["from"], "today": bool(r.get("today")),
+                     "used": used, "share": share, "rough": r.get("rough", False),
+                     "over": used is not None and used > share + 0.5})
+
+    busy = (session or {}).get("utilization")
+    return {
+        "verdict": verdict(a),
+        "state": "on plan" if abs(a["delta"]) <= TOLERANCE else "over" if a["delta"] > 0 else "under",
+        "block": "tonight" if a["evening"] else "today",
+        "need": need, "planned": planned, "lately": lately,
+        "pace": pace and {"ends": pace["ends"], "full_at": pace.get("full_at"), "thin": pace["thin"],
+                          "per_plan": pace["used"] / pace["planned"]},
+        "days": days,
+        "session": busy, "session_resets": local(session["resets_at"]) if busy is not None
+        and session.get("resets_at") else None,
+    }
 
 
 # ── rendering ────────────────────────────────────────────────────────────────
 def clock(t: datetime) -> str:
     return t.strftime("%a %-I:%M %p")
+
+
+def moment(t: datetime, now: datetime) -> str:
+    """A time to come: to the minute when it's today, else the day and hour are enough."""
+    return f"{t:%-I:%M %p}" if t.date() == now.date() else f"{t:%a %-I %p}"
 
 
 def span(td: timedelta) -> str:
@@ -571,212 +619,485 @@ def card(title: str, aside: str, lines: list[str]) -> None:
     print(dim(f"╰{'─' * inner}╯"))
 
 
-# The card as a picture, for places a terminal can't go. A dark terminal's palette.
-PAPER, EDGE, TRACK = "#0d1117", "#30363d", "#21262d"
-INK = {"": "#c9d1d9", "2": "#8b949e", "31": "#f85149", "32": "#3fb950", "33": "#d29922"}
+# ── the picture ──────────────────────────────────────────────────────────────
+# --png draws its own card rather than a screenshot of the terminal one: it is
+# looked at shrunk in a chat feed, so the verdict is set large, the details
+# small, and the week is a chart. The face is Geist, fetched once and cached;
+# DejaVu Sans stands in if it can't be.
+GEIST = "https://cdn.jsdelivr.net/npm/geist@1.3.1/dist/fonts/geist-sans/Geist-{}.ttf"
+WEIGHTS = {400: "Regular", 500: "Medium", 600: "SemiBold", 700: "Bold"}
+BG, PANEL, TRACK, RULE, SHADE = "#0e1116", "#161b22", "#262c36", "#39414d", "#1b2230"
+INK, SOFT, MUTED, FAINT = "#e6edf3", "#c9d1d9", "#8b949e", "#6e7681"
+GOOD, WARN, BAD, BLUE, BLUE_DEEP = "#4ade80", "#ff9b3d", "#f85149", "#58a6ff", "#1f6feb"
 
 
-# Monospace faces to try, as (regular, bold) file names Pillow finds in the system's font folders.
-FONTS = (("DejaVuSansMono.ttf", "DejaVuSansMono-Bold.ttf"), ("LiberationMono-Regular.ttf", "LiberationMono-Bold.ttf"),
-         ("Menlo.ttc", "Menlo.ttc"), ("consola.ttf", "consolab.ttf"))
+def face_file(weight: int) -> str:
+    """A cached Geist file for `weight`, fetched on first use; DejaVu if that fails."""
+    name = WEIGHTS[weight]
+    path = CACHE.parent / "fonts" / f"Geist-{name}.ttf"
+    if not path.exists():
+        try:
+            with urllib.request.urlopen(GEIST.format(name), timeout=10) as r:
+                data = r.read()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+        except OSError:
+            return "DejaVuSans-Bold.ttf" if weight >= 600 else "DejaVuSans.ttf"
+    return str(path)
 
 
-def png(text: str, out) -> None:
-    """The card as printed, ANSI and all → a PNG written to `out` (a path or a
-    binary stream). Bars and rules are drawn as shapes and every character
-    sits on a fixed grid, so nothing depends on how a font spaces odd glyphs."""
+def mix(a: str, b: str, t: float) -> str:
+    """`a` laid over `b` at opacity `t`, as one opaque colour."""
+    pa, pb = (tuple(int(h[i:i + 2], 16) for i in (1, 3, 5)) for h in (a, b))
+    return "#" + "".join(f"{round(x * t + y * (1 - t)):02x}" for x, y in zip(pa, pb))
+
+
+def poster(a: dict, now: datetime, plan: Plan, f: dict, notes: list[str], fetched_at: float | None, out) -> None:
+    """The card as a PNG written to `out` (a path or a binary stream). Laid out
+    on a 1200-wide grid, drawn at three times that and halved, so the edges
+    come out smooth at 1800 pixels."""
     try:
-        from PIL import Image, ImageDraw, ImageFont  # only this path pays for the import
+        from PIL import Image, ImageDraw, ImageFont, features  # only this path pays for the import
     except ImportError:
         sys.exit("ccpace: --png needs Pillow; run ccpace through uv, which installs it")
-    Z = 2  # twice life size, so it stays sharp when a chat client scales it
-    for names in FONTS:
-        try:
-            plain, heavy = (ImageFont.truetype(name, 14 * Z) for name in names)
-            break
-        except OSError:
-            continue
+    S, W, P = 3, 1200, 44
+    tnum = {"features": ["tnum"]} if features.check("raqm") else {}  # figures that line up
+    fonts: dict = {}
+    ops: list = []  # drawn once the height is known
+
+    def font(size: float, weight: int = 400):
+        key = (size, weight)
+        if key not in fonts:
+            try:
+                fonts[key] = ImageFont.truetype(face_file(weight), round(size * S))
+            except OSError:
+                fonts[key] = ImageFont.load_default(round(size * S))
+        return fonts[key]
+
+    def width(s: str, size: float, weight: int = 400) -> float:
+        return font(size, weight).getlength(s, **tnum) / S
+
+    def text(x: float, y: float, s: str, size: float, weight: int = 400, fill: str = INK, anchor: str = "ls") -> float:
+        """Draw `s` with its baseline at y; returns the x where it ends."""
+        ops.append(lambda d: d.text((x * S, y * S), s, font=font(size, weight), fill=fill, anchor=anchor, **tnum))
+        return x + width(s, size, weight)
+
+    def runs(x: float, y: float, parts: list[tuple], align: str = "left") -> None:
+        """Several (text, size, weight, colour) runs on one baseline."""
+        total = sum(width(t, z, w) for t, z, w, _ in parts)
+        x = x - total if align == "right" else x - total / 2 if align == "center" else x
+        for t, z, w, c in parts:
+            x = text(x, y, t, z, w, c)
+
+    def box(x: float, y: float, w: float, h: float, fill: str | None, r: float = 0, outline: str | None = None,
+            line: float = 0) -> None:
+        if w > 0 and h > 0:
+            ops.append(lambda d: d.rounded_rectangle((x * S, y * S, (x + w) * S, (y + h) * S), r * S, fill=fill,
+                                                     outline=outline, width=round(line * S)))
+
+    def stroke(pts: list[tuple[float, float]], fill: str, w: float, dash: tuple[float, float] | None = None) -> None:
+        if len(pts) < 2:
+            return
+        if not dash:
+            ops.append(lambda d: d.line([(x * S, y * S) for x, y in pts], fill=fill, width=round(w * S), joint="curve"))
+            return
+        on, off = dash  # walk the line, pen down for `on`, up for `off`
+        seg, run, down, spans = [pts[0]], 0.0, True, []
+        for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
+            length = ((x1 - x0) ** 2 + (y1 - y0) ** 2) ** 0.5
+            done = 0.0
+            while done < length:
+                step = min((on if down else off) - run, length - done)
+                done += step
+                run += step
+                pt = (x0 + (x1 - x0) * done / length, y0 + (y1 - y0) * done / length)
+                if down:
+                    seg.append(pt)
+                if run >= (on if down else off) - 1e-9:
+                    if down:
+                        spans.append(seg)
+                    down, run, seg = not down, 0.0, [pt]
+        if down and len(seg) > 1:
+            spans.append(seg)
+        for sp in spans:
+            if on <= w:  # a dash no longer than it is wide reads as a dot
+                x, y = sp[0]
+                dot(x, y, w / 2, fill)
+            else:
+                ops.append(lambda d, sp=sp: d.line([(x * S, y * S) for x, y in sp], fill=fill, width=round(w * S)))
+
+    def dot(x: float, y: float, r: float, fill: str, ring: str | None = None, ring_w: float = 0) -> None:
+        ops.append(lambda d: d.ellipse(((x - r - ring_w) * S, (y - r - ring_w) * S, (x + r + ring_w) * S,
+                                        (y + r + ring_w) * S), fill=ring or fill))
+        if ring:
+            ops.append(lambda d: d.ellipse(((x - r) * S, (y - r) * S, (x + r) * S, (y + r) * S), fill=fill))
+
+    def wrapped(s: str, size: float, weight: int, room: float) -> list[str]:
+        lines, line = [], ""
+        for word in s.split():
+            if line and width(f"{line} {word}", size, weight) > room:
+                lines.append(line)
+                line = word
+            else:
+                line = f"{line} {word}".strip()
+        return [*lines, line] if line else lines
+
+    def label(x: float, y: float, s: str, size: float = 18) -> None:
+        text(x, y, s.upper(), size, 600, MUTED)
+
+    used, exp, delta = a["used"], a["expected"], a["delta"]
+    v, state = f["verdict"], f["state"]
+    tone = {"go": GOOD, "ok": GOOD, "slow": WARN, "stop": BAD}[v["tone"]]
+    left_x, inner = P, W - 2 * P
+
+    # the header: whose meter, when, and how long the week has left
+    age = "" if fetched_at is None else " · updated now" if (old := time.time() - fetched_at) < 60 else \
+        f" · updated {span(timedelta(seconds=old))} ago"
+    runs(left_x, 62, [("Claude Code", 20, 700, INK), (f"  ·  {clock(now)}{age}", 20, 400, MUTED)])
+    runs(W - P, 62, [("week resets ", 20, 400, MUTED), (clock(plan.reset), 20, 600, INK),
+                     (f" · {span(plan.reset - now)}", 20, 400, MUTED)], "right")
+
+    # the verdict: what to do in big type, where the meter stands beside it
+    y, side = 88, 340
+    room = inner - 64 - side - 40
+    body = wrapped(v["body"], 26, 400, room)
+    more = [ln for m in v["more"] for ln in wrapped(m, 20, 400, room)]
+    tall = max(64 + 18 + 35 * len(body) + 28 * len(more), 160)
+    box(left_x, y, inner, tall + 56, PANEL, 16)
+    top = y + 28 + (tall - (64 + 18 + 35 * len(body) + 28 * len(more))) / 2
+    text(left_x + 32, top + 54, v["head"], 64, 500, tone)
+    for i, ln in enumerate(body):
+        text(left_x + 32, top + 64 + 18 + 26 + 35 * i, ln, 26, 400, SOFT)
+    for i, ln in enumerate(more):
+        text(left_x + 32, top + 64 + 18 + 35 * len(body) + 22 + 28 * i, ln, 20, 400, MUTED)
+    sx, sy = W - P - 32 - side, y + 28 + (tall - 160) / 2
+    word = {"under": "under plan", "over": "over plan", "on plan": "on plan"}[state]
+    runs(sx, sy + 46, [(f"{abs(delta):.1f}", 52, 600, INK), (f"  {word}", 24, 400, SOFT)])
+    box(sx, sy + 70, side, 12, TRACK, 6)
+    span_ = 15.0  # the scale runs ±15 points; the middle band is the tolerance
+    box(sx + side * (0.5 - TOLERANCE / span_ / 2), sy + 70, side * TOLERANCE / span_, 12, RULE)
+    mark = GOOD if state != "over" else WARN
+    dot(sx + side * (0.5 + max(min(delta, span_), -span_) / span_ / 2), sy + 76, 12, mark, PANEL, 4)
+    for name, at, anchor in (("under", 0, "ls"), ("on plan", 0.5, "ms"), ("over", 1, "rs")):
+        lit = name == state
+        text(sx + side * at, sy + 112, name, 16, 600 if lit else 400, mark if lit else MUTED, anchor)
+    text(sx, sy + 146, f"{used:.0f}% used · plan says {exp:.0f}%", 18, 400, MUTED)
+    y += tall + 56 + 22
+
+    # three tiles: today's allowance, the speed in %/h, and the clocks
+    tw, th = (inner - 36) / 3, 250
+    for i in range(3):
+        box(left_x + i * (tw + 18), y, tw, th, PANEL, 14)
+    x = left_x + 24
+    bw = tw - 48
+
+    label(x, y + 42, "today")
+    share, spent = a["day_allowance"], a["day_used"]
+    if share > 0.05:
+        due = max(exp - a["day_start"], 0.0)
+        over = spent > share
+        hue = BAD if over else tone
+        runs(x, y + 98, [(f"{spent:.0f}", 44, 700, INK), (f" / {share:.0f}%", 24, 400, MUTED)])
+        box(x, y + 120, bw, 22, TRACK, 6)
+        box(x, y + 120, bw * min(spent / share, 1), 22, hue, 6)
+        box(x + bw * min(due / share, 1) - 1.5, y + 114, 3, 34, INK)
+        text(x, y + 174, f"from {a['day_start']:.0f}%", 17, 400, MUTED)
+        text(x + bw / 2, y + 174, f"by now {due:.0f}", 17, 400, MUTED, "ms")
+        text(x + bw, y + 174, f"bed {a['bedtime_target']:.0f}%", 17, 400, MUTED, "rs")
+        if over:
+            runs(x, y + 218, [(f"{spent - share:.0f}% past", 20, 700, BAD), (" the bedtime target", 20, 400, SOFT)])
+        else:
+            runs(x, y + 218, [(f"{a['room_today']:.0f}% left", 20, 700, hue), (f" for {f['block']}", 20, 400, SOFT)])
     else:
-        sys.exit("ccpace: --png needs a monospace font; install DejaVu Sans Mono (fonts-dejavu-core)")
-    CW, LH, PAD = plain.getlength("0"), 20 * Z, 20 * Z
-    shapes, glyphs, width = [], [], 0
-    lines = text.rstrip("\n").split("\n")
+        runs(x, y + 98, [(f"{spent:.0f}%", 44, 700, INK)])
+        box(x, y + 120, bw, 22, BAD, 6)
+        text(x, y + 174, f"began at {a['day_start']:.0f}%, past bed", 17, 400, MUTED)
 
-    def rect(x: float, y: float, w: float, h: float, fill: str, r: float = 0) -> None:
-        shapes.append(((round(x), round(y), round(x + w) - 1, round(y + h) - 1), fill, r))
+    x += tw + 18
+    label(x, y + 42, "speed now")
+    rate = {d["name"]: d for d in f["lately"]}
+    hour = rate.get("1h", {"rate": 0.0, "rough": False, "thin": False})
+    need, planned = f["need"], f["planned"]
+    parts = [(f"{hour['rate']:.1f}", 44, 700, INK), ("%/h", 24, 400, MUTED)]
+    if need is not None:
+        parts.append((f"  → {need:.1f}", 24, 600, BLUE))
+    runs(x, y + 98, parts)
+    top_rate = max([5.0, *(d["rate"] for d in f["lately"]), need or 0, planned or 0]) * 1.1
+    px = lambda r: x + bw * min(r / top_rate, 1)  # noqa: E731
+    text(x, y + 116, "0", 13, 400, FAINT)
+    text(x + bw, y + 116, f"{top_rate:.0f}%/h", 13, 400, FAINT, "rs")
+    box(x, y + 137, bw, 6, TRACK, 3)
+    marks = []
+    if need is not None:
+        box(px(need) - bw * 0.03, y + 131, bw * 0.06, 18, BLUE_DEEP, 4)
+        marks.append((px(need), "need", BLUE))
+    if planned:
+        box(px(planned) - 1, y + 128, 2, 24, MUTED)
+        marks.append((px(planned), "plan", MUTED))
+    for name, r in (("6h", 7), ("15m", 7), ("1h", 10)):
+        if name in rate:
+            dot(px(rate[name]["rate"]), y + 140, r, GOOD if name == "1h" else mix(GOOD, PANEL, 0.5),
+                PANEL if name == "1h" else None, 3)
+    marks.append((px(hour["rate"]), "1h", GOOD))
+    marks.sort()
+    for i in range(1, len(marks)):  # keep the little labels from landing on each other
+        if marks[i][0] - marks[i - 1][0] < 38:
+            marks[i] = (marks[i - 1][0] + 38, *marks[i][1:])
+    for mx, name, hue in marks:
+        text(min(mx, x + bw - 12), y + 168, name, 13, 500, hue, "ms")
+    text(x, y + 196, " · ".join(f"{n} {('~' if d['rough'] else '')}{d['rate']:.1f}{'?' if d['thin'] else ''}"
+                                for n, d in rate.items()), 17, 400, MUTED)
+    if f["pace"]:
+        ends = f["pace"]["ends"]
+        hue = BAD if ends > 100 + TOLERANCE else WARN if ends < 100 - TOLERANCE else GOOD
+        tail = f" · full {moment(f['pace']['full_at'], now)}" if ends > 100 + TOLERANCE and f["pace"]["full_at"] else " at reset"
+        runs(x, y + 228, [("at this pace ", 20, 400, SOFT),
+                          (f"{min(ends, 999):.0f}%{'?' if f['pace']['thin'] else ''}", 20, 700, hue),
+                          (tail, 20, 400, SOFT)])
 
-    for row, line in enumerate(lines):
-        y, col = PAD + row * LH, 0
-        strong = faint = lit = False
-        hue = ""
-        for part in re.split(r"(\033\[[0-9;]*m)", line):
-            if part.startswith("\033"):
-                for code in part[2:-1].split(";"):
-                    if code in ("", "0"):
-                        strong = faint = lit = False
-                        hue = ""
-                    elif code in ("1", "2", "7"):
-                        strong, faint, lit = strong or code == "1", faint or code == "2", lit or code == "7"
-                    else:
-                        hue = code
-                continue
-            ink = INK.get(hue or ("2" if faint else ""), INK[""])
-            if lit:  # reverse video: a filled badge with the text knocked out
-                rect(PAD + col * CW, y + Z, len(part) * CW, LH - 2 * Z, ink, 3 * Z)
-                ink = PAPER
-            for i, ch in enumerate(part, col):
-                x = PAD + i * CW
-                if ch == "█":
-                    rect(x, y + 4 * Z, CW, LH - 8 * Z, ink)
-                elif ch == "░":
-                    rect(x, y + 4 * Z, CW, LH - 8 * Z, TRACK)
-                elif ch in "│┃":
-                    thick = (3 if ch == "┃" else 1.2) * Z
-                    rect(x + (CW - thick) / 2, y + Z, thick, LH - 2 * Z, INK[""] if ch == "┃" and not hue else ink)
-                elif ch != " ":
-                    glyphs.append((x, y + 14.5 * Z, ch, ink, heavy if strong else plain))
-            col += len(part)
-        width = max(width, col)
+    x += tw + 18
+    label(x, y + 42, "time left")
+    runs(x, y + 96, [(f["block"], 20, 400, SOFT)])
+    runs(x + bw, y + 96, [(span(a["eod"] - now), 36, 700, INK)], "right")
+    if f["session"] is not None:
+        runs(x, y + 144, [("session", 20, 400, SOFT), (f"  {f['session']:.0f}% used", 17, 400, MUTED)])
+        if f["session_resets"]:
+            runs(x + bw, y + 144, [(span(f["session_resets"] - now), 28, 600, INK)], "right")
+        box(x, y + 158, bw, 8, TRACK, 4)
+        box(x, y + 158, bw * min(f["session"] / 100, 1), 8, MUTED, 4)
+    runs(x, y + 210, [("week", 20, 400, SOFT)])
+    runs(x + bw, y + 210, [(span(plan.reset - now), 28, 600, INK)], "right")
+    y += th + 22
 
-    w, h = round(width * CW) + 2 * PAD, len(lines) * LH + 2 * PAD
-    image = Image.new("RGBA", (w, h))  # clear outside the rounded corners
+    # the week: the meter against the plan, and each day against its share
+    box(left_x, y, inner, 560, PANEL, 14)
+    runs(left_x + 24, y + 34, [("THE WEEK", 16, 600, MUTED),
+                               ("   meter vs plan · bars: what each day used vs its share", 16, 400, MUTED)])
+    ox, oy = left_x + 24, y + 50
+    X0, X1, Y0, Y1 = ox + 44, ox + 884, oy + 40, oy + 256
+    t0, t1 = plan.start, plan.reset
+    whole = (t1 - t0).total_seconds()
+
+    def X(t: datetime) -> float:
+        return X0 + (X1 - X0) * min(max((t - t0).total_seconds() / whole, 0), 1)
+
+    pace = f["pace"]
+    ends = pace["ends"] if pace else 100.0
+    vmax = max(100.0, min(ends, 130.0))
+
+    def Y(v: float) -> float:
+        return Y1 - (Y1 - Y0) * min(max(v, 0), vmax) / vmax
+
+    days = f["days"]
+    bounds = [d["from"] for d in days] + [t1]
+    for d, lo, hi in zip(days, bounds, bounds[1:]):
+        if d["today"]:
+            box(X(lo), Y0, X(hi) - X(lo), Y1 - Y0, SHADE)
+    for g in (0, 50, 100):
+        stroke([(X0, Y(g)), (X1, Y(g))], TRACK, 1)
+        text(X0 - 8, Y(g) + 5, f"{g}", 14, 400, MUTED, "rs")
+    for lo in bounds[1:-1]:
+        stroke([(X(lo), Y0), (X(lo), Y1)], TRACK, 1)
+
+    step = timedelta(minutes=20)
+    ticks = [t0 + step * i for i in range(int(whole // step.total_seconds()) + 1)] + [t1]
+    log = [(t0, 0.0), *((t, u) for t, u in readings(plan, now) if t0 < t < now), (now, used)]
+    pts = [(X(t), Y(u)) for t, u in log]
+    ops.append(lambda d: d.polygon([(x * S, y * S) for x, y in [*pts, (X(now), Y1), (X0, Y1)]],
+                                   fill=mix(GOOD, PANEL, 0.12)))
+    stroke([(X(t), Y(plan.at(t))) for t in ticks], MUTED, 2.5, (7, 6))
+    later = [t for t in ticks if t > now]
+    if pace:
+        stroke([(X(now), Y(used))] + [(X(t), Y(used + pace["per_plan"] * (plan.at(t) - exp))) for t in later],
+               WARN, 3, (2, 7))
+    tonight = a["room_today"] > 0
+    if tonight:
+        eod = min(a["eod"], t1)
+        stroke([(X(now), Y(used)), (X(eod), Y(a["bedtime_target"]))], BLUE, 3.5)
+    stroke(pts, GOOD, 4)
+    stroke([(X(now), oy + 30), (X(now), Y1)], FAINT, 1.5, (3, 4))
+    stroke([(X(now), Y(used)), (X(now), Y(exp))], INK, 3)
+    dot(X(now), Y(exp), 5, MUTED)
+    if tonight:
+        dot(X(min(a["eod"], t1)), Y(a["bedtime_target"]), 5, BLUE)
+    dot(X(now), Y(used), 8, GOOD if state != "over" else WARN, PANEL, 3)
+    caption = [("now ", 17, 600, INK), (f"{used:.0f}%", 17, 600, GOOD if state != "over" else WARN),
+               (f" vs plan {exp:.0f}%", 17, 600, MUTED)]
+    cw = sum(width(t, z, w) for t, z, w, _ in caption)
+    runs(min(max(X(now), X0 + cw / 2), X1 - cw / 2), oy + 20, caption, "center")
+
+    # the lines are named in the margin, by where they end, nudged apart
+    names = [(Y(100), "plan → 100%", MUTED)]
+    if pace:
+        names.append((Y(ends), f"this pace → {min(ends, 999):.0f}%", WARN))
+    if tonight:
+        names.append((Y(a["bedtime_target"]), f"{f['block']} → {a['bedtime_target']:.0f}%", BLUE))
+    names.sort()
+    for i in range(1, len(names)):
+        if names[i][0] - names[i - 1][0] < 24:
+            names[i] = (names[i - 1][0] + 24, *names[i][1:])
+    for ny, s, hue in names:
+        text(X1 + 14, ny + 6, s, 16, 600, hue)
+
+    # one bar per day under its stretch of the chart: a dashed outline for its share, filled by what it used
+    base, tallest = oy + 430, max([1.0, *(max(d["share"], d["used"] or 0) for d in days)])
+    k = 110 / tallest
+    stroke([(X0, base), (X1, base)], RULE, 2)
+    for d, lo, hi in zip(days, bounds, bounds[1:]):
+        bx, bw_ = X(lo) + 10, X(hi) - X(lo) - 20
+        if bw_ <= 4:
+            continue
+        top = base - d["share"] * k
+        for edge in ([(bx, base), (bx, top), (bx + bw_, top), (bx + bw_, base)],):
+            stroke(edge, "#4a5361", 2.5, (7, 5))
+        hue = WARN if d["over"] else GOOD
+        if d["used"] is not None:
+            box(bx, base - d["used"] * k, bw_, d["used"] * k, hue, 6)
+            text(bx + bw_ / 2, base - max(d["used"], d["share"]) * k - 10,
+                 f"{'~' if d['rough'] else ''}{d['used']:.0f}", 20, 700, hue, "ms")
+        mid = (X(lo) + X(hi)) / 2
+        text(mid, oy + 458, d["label"], 17 if d["today"] else 16, 700 if d["today"] else 500,
+             INK if d["today"] else FAINT if d["used"] is None else SOFT, "ms")
+        text(mid, oy + 480, f"of {d['share']:.0f}", 15, 400, MUTED, "ms")
+    box(X1 + 14, oy + 348, 18, 18, GOOD, 4)
+    text(X1 + 40, oy + 363, "used", 15, 400, SOFT)
+    stroke([(X1 + 14, oy + 380), (X1 + 32, oy + 380), (X1 + 32, oy + 398), (X1 + 14, oy + 398), (X1 + 14, oy + 380)],
+           "#4a5361", 2, (4, 3))
+    text(X1 + 40, oy + 395, "day's share", 15, 400, SOFT)
+    y += 560
+
+    # the small print, only when there is some
+    small = [text_ for on, text_ in (
+        (any(d["rough"] for d in days) or any(d["rough"] for d in f["lately"]), "~ gap in history"),
+        (any(d["thin"] for d in f["lately"]), "? single tick"),
+        (a["day_start_note"], f"today {a['day_start_note']}"),
+    ) if on] + [f"! {n}" for n in notes]
+    for ln in wrapped(" · ".join(small), 16, 400, inner) if small else []:
+        y += 26
+        text(left_x, y + 4, ln, 16, 400, MUTED)
+    H = y + 36
+
+    image = Image.new("RGBA", (W * S, round(H * S)))  # clear outside the rounded corners
     draw = ImageDraw.Draw(image)
-    draw.rounded_rectangle((0, 0, w - 1, h - 1), 10 * Z, fill=PAPER, outline=EDGE, width=Z)
-    for box, fill, r in shapes:
-        draw.rounded_rectangle(box, r, fill=fill)
-    for x, y, ch, ink, font in glyphs:
-        draw.text((x, y), ch, font=font, fill=ink, anchor="ls")
+    draw.rounded_rectangle((0, 0, W * S - 1, H * S - 1), 20 * S, fill=BG)
+    for op in ops:
+        op(draw)
+    image = image.resize((W * S // 2, round(H * S / 2)), Image.LANCZOS)
     try:
-        image.save(out, "PNG")
+        image.save(out, "PNG", optimize=True)
     except OSError as e:
         sys.exit(f"ccpace: can't write the image: {e}")
 
 
-def render(a: dict, now: datetime, plan: Plan, session: dict | None, notes: list[str], speed: list[dict],
-           fetched_at: float | None = None) -> None:
-    W = 25
+def render(a: dict, now: datetime, plan: Plan, f: dict, notes: list[str], fetched_at: float | None = None) -> None:
+    """The terminal card: the week on two lines, three tiles, and the verdict
+    last, nearest the prompt, where the eye lands."""
+    WIDE = (20, 29, 20)  # the tiles' text widths: today, speed, time left
+    T = sum(WIDE) + 3 * 4 + 2  # the row of them, borders and gaps included
     used, exp, delta = a["used"], a["expected"], a["delta"]
-    block = "tonight" if a["evening"] else "today"
+    tones = {"go": green, "ok": green, "slow": yellow, "stop": red}
     out: list[str] = []
     p = out.append
 
     def pct(x: float) -> str:
         return f"{x:.1f}" if x < 10 else f"{x:.0f}"
 
-    def meter(name: str, frac: float, tone, at: float | None = None, gist: str = "",
-              used: str = "", expect: str = "", note: str = "") -> None:
-        """One row of the top table: a bar with the expected point struck
-        through it, the gist in a word or two, then the numbers."""
-        fill = round(W * min(max(frac, 0.0), 1.0))
-        cells = [tone("█")] * fill + [dim("░")] * (W - fill)
+    def bar(frac: float, at: float | None, width: int, tone) -> str:
+        """A bar filled to `frac`, with the point it was expected at struck through it."""
+        fill = round(width * min(max(frac, 0.0), 1.0))
+        cells = [tone("█")] * fill + [dim("░")] * (width - fill)
         if at is not None:
-            cells[min(max(round(W * at), 0), W - 1)] = bold("┃")
-        p(f"  {dim(f'{name:<9}')}{''.join(cells)}  {tone(f'{gist:<14}')}{bold(f'{used:>6}')}{dim(f'{expect:>8}')}"
-          + (f"   {note}" if note else ""))
+            cells[min(max(round(width * at), 0), width - 1)] = bold("┃")
+        return "".join(cells)
 
-    # Laid out to be read from the bottom up, which is where a terminal leaves
-    # the eye: the week's days first, then the meters, then the last few hours,
-    # and the verdict last.
+    def width(s: str) -> int:
+        return len(ANSI.sub("", s))
 
-    # speed: each stretch as a bar off its budget — slow grows left, fast grows
-    # right, and the right edge is 2× the budget. The columns after it are what
-    # moved vs that budget, and where the meter closed vs its target.
-    H = W // 2
+    def spread(left: str, right: str, n: int) -> str:
+        return left + " " * max(n - width(left) - width(right), 1) + right
 
-    def heading(name: str, scale: str, *cols: str) -> str:
-        return dim(f"  {name:<9}{scale:<{W}}{'':16}{'used':>6}{'budget':>8}{''.join(cols)}")
+    def tile(name: str, rows: list[str], n: int) -> list[str]:
+        top = dim(f"┌ {name} {'─' * (n - len(name))}┐")
+        return [top, *(dim("│ ") + r + " " * max(n - width(r), 0) + dim(" │") for r in rows), dim(f"└{'─' * (n + 2)}┘")]
 
-    def stretch(r: dict) -> None:
-        style = bold if r.get("today") else dim
-        s, ahead = r["speed"], r.get("ahead")
-        cols = (f"{'·' if ahead else pct(r['used']):>6}{pct(r['budget']):>8}"
-                + (f"{'·' if ahead else format(r['meter'], '.0f'):>7}{r['target']:>7.0f}" if "target" in r else ""))
-        if "ends" in r:
-            unsure = "?" if r["thin"] else ""
-            ends = f"{min(r['ends'], 999):.0f}%{unsure}"
-            cols += (red if r["ends"] > 100 + TOLERANCE else green)(f"{ends:>9}")
-            if "full_at" in r:
-                # to the minute when it's today, else the day and hour are enough
-                near = r["full_at"].date() == now.date()
-                cols += red((f"{r['full_at']:{'%-I:%M%p' if near else '%a %-I%p'}}" + unsure).rjust(10))
-        if s is None:
-            p(f"  {style(f'{r['label']:<9}')}{dim('░' * H + '│' + '░' * H)}{'':16}{style(cols)}")
-            return
-        n = min(round(abs(s - 1) * H), H)
-        word = "on pace" if abs(s - 1) <= ON_PACE else "slow" if s < 1 else "fast"
-        tone = red if word == "fast" else green
-        left, right = (n, 0) if s < 1 else (0, n)
-        bar = (dim("░" * (H - left)) + tone("█" * left) + tone("┃" if word == "on pace" else "│")
-               + tone("█" * right) + dim("░" * (H - right)))
-        times = ("~" if r["rough"] else "") + f"{s:.1f}×"
-        p(f"  {style(f'{r['label']:<9}')}{bar}  {tone(bold(f'{times:>5}'))} {tone(f'{word:<7}')} {style(cols)}")
-
-    # the days of the week
-    p(heading("speed", f"{'◀ slow':<{H - 3}}{'on pace':^7}{'fast ▶':>{H - 3}}", f"{'meter':>7}", f"{'target':>7}"))
-    for r in speed:
-        if not r.get("recent"):
-            stretch(r)
+    # the week: where the meter is against the plan, and each day against its share
+    tone = yellow if delta > TOLERANCE else green
+    p(f"  {dim('week')}  {bar(used / 100, exp / 100, 40, tone)}  {bold(f'{used:.0f}%')}"
+      + dim(f"  plan {exp:.0f}%  bed {a['bedtime_target']:.0f}%"))
+    cells = []
+    for d in f["days"]:
+        n = "·" if d["used"] is None else ("~" if d["rough"] else "") + (pct(d["used"]) if d["used"] < 1 else f"{d['used']:.0f}")
+        cell = f"{d['label']} {n}/{d['share']:.0f}"
+        cells.append(yellow(cell) if d["over"] else bold(cell) if d["today"] else
+                     dim(cell) if d["used"] is None else cell)
+    p("        " + "  ".join(cells))
     p("")
 
-    state = "on pace" if abs(delta) <= TOLERANCE else "over" if delta > 0 else "under"
-    p(dim(f"  {'meter':<9}{'':{W}}{'':16}{'used':>6}{'expect':>8}"))
-    meter("week", used / 100, yellow if delta > TOLERANCE else green, exp / 100,
-          f"{delta:+5.1f} {state}", f"{used:.0f}%", f"{exp:.0f}%")
-
-    # today: used since the day began, out of what it takes to reach the
-    # bedtime target from there (so a day started under plan gets more)
+    # today's allowance: from the meter's real starting point to the bedtime target
     share, spent = a["day_allowance"], a["day_used"]
     if share > 0.05:
-        due = max(exp - a["day_start"], 0.0)  # of today's allowance, what was expected by now
-        tone = red if spent > share else yellow if delta > TOLERANCE else green
-        gist = f"{spent - share:4.0f}% past" if spent > share else f"{a['room_today']:4.0f}% left"
-        meter("today", spent / share, tone, due / share, gist, f"{spent:.0f}%", f"{due:.0f}%", dim(f"of {share:.0f}%"))
+        due = max(exp - a["day_start"], 0.0)
+        over = spent > share
+        t = red if over else tone
+        today = [spread(bold(f"{spent:.0f}") + dim(f" of {share:.0f}%"),
+                        t(f"{spent - share:.0f} past") if over else t(f"{a['room_today']:.0f} left"), WIDE[0]),
+                 bar(spent / share, due / share, WIDE[0], t),
+                 spread(dim(f"by now {due:.0f}"), dim(f"bed {a['bedtime_target']:.0f}%"), WIDE[0])]
     else:  # the day began at or past its bedtime target
-        meter("today", 1.0 if spent > 0.5 else 0.0, red, gist="    at target", used=f"{spent:.0f}%", expect="·",
-              note=dim(f"began at {a['day_start']:.0f}%"))
+        today = [spread(bold(f"{spent:.0f}%"), red("at target"), WIDE[0]), bar(1.0, None, WIDE[0], red),
+                 dim(f"began at {a['day_start']:.0f}%")]
 
-    busy = (session or {}).get("utilization")
-    if busy is not None:
-        gist = note = ""
-        if session.get("resets_at"):
-            r = local(session["resets_at"])
-            gist, note = f"resets {span(r - now)}", dim(f"at {r:%-I:%M %p}")
-        meter("session", busy / 100, red if busy >= 90 else yellow if busy >= 75 else green, gist=gist,
-              used=f"{busy:.0f}%", note=note)
+    # speed in %/h: what the last stretches ran at, against what tonight needs
+    rate = {d["name"]: d for d in f["lately"]}
+
+    def r(name: str) -> str:
+        d = rate.get(name)
+        return "·" if d is None else ("~" if d["rough"] else "") + f"{d['rate']:.1f}" + ("?" if d["thin"] else "")
+
+    need = f"{f['need']:.1f}" if f["need"] is not None else "—"
+    fast = []
+    if f["pace"]:
+        ends, unsure = f["pace"]["ends"], "?" if f["pace"]["thin"] else ""
+        hot = ends > 100 + TOLERANCE
+        fast = [(red if hot else green)(f"→ {min(ends, 999):.0f}%{unsure}")
+                + dim(f" full {moment(f['pace']['full_at'], now)}" if hot and f["pace"]["full_at"] else " at reset")]
+    speed = [spread(f"last hour {bold(r('1h'))}", f"need {bold(c('36', need))}", WIDE[1]),
+             spread(dim(f"15m {r('15m')} · 6h {r('6h')}"), dim(f"plan {f['planned'] or 0:.1f}"), WIDE[1]),
+             *(fast or [dim("no pace to project")])]
+
+    # the clocks
+    left = [spread(f["block"], bold(span(a["eod"] - now)), WIDE[2]),
+            spread("session" + (dim(f" {f['session']:.0f}%") if f["session"] is not None else ""),
+                   bold(span(f["session_resets"] - now)) if f["session_resets"] else dim("·"), WIDE[2]),
+            spread("week", bold(span(plan.reset - now)), WIDE[2])]
+
+    for row in zip(tile("today", today, WIDE[0]), tile("speed %/h", speed, WIDE[1]),
+                   tile("time left", left, WIDE[2])):
+        p("  " + " ".join(row))
     p("")
 
-    # the last few hours, longest first so the freshest sits nearest the verdict.
-    # These project the week: where the meter ends at that pace, and when it would fill
-    p(heading("lately", "", f"{'at reset':>9}", f"{'full':>10}"))
-    for r in reversed([r for r in speed if r.get("recent")]):
-        stretch(r)
-    p("")
-    p(dim(f"  today, lately: vs pace to {block}'s {a['bedtime_target']:.0f}% · days: vs plan"))
     # one line of caveats, only the ones in play
     marks = [text for on, text in (
-        (any(r.get("rough") for r in speed), "~ gap in history"),
-        (any(r.get("thin") for r in speed), "? single tick"),
+        (any(d["rough"] for d in f["days"]) or any(d["rough"] for d in f["lately"]), "~ gap in history"),
+        (any(d["thin"] for d in f["lately"]), "? single tick"),
         (a["day_start_note"], f"today {a['day_start_note']}"),
     ) if on]
     if marks:
         p(dim("  " + " · ".join(marks)))
     for n in notes:
-        out.extend(dim(f"  {part}") for part in wrap(f"! {n}", W + 53))
-    p("")
+        out.extend(dim(f"  {part}") for part in wrap(f"! {n}", T))
+    if marks or notes:
+        p("")
 
-    # the verdict last: under · on pace · over, with the current one lit up
-    # the amount lives inside the lit label so it can't be read against a neighbour
-    lit = {"under": "1;7;32", "on pace": "1;7;32", "over": "1;7;33"}
-    label = state.upper()
-    if abs(delta) >= 0.5:
-        label += f" by {abs(delta):.1f}%" if state != "on pace" else f" · {abs(delta):.1f}% {'over' if delta > 0 else 'under'}"
-    p(" " + " ".join(
-        (c(lit[s], f" {label} ") if COLOR else f"[{label}]") if s == state else dim(f" {s} ")
-        for s in lit))
-    for line in advice(a):
-        out.extend(f"  {part}" for part in wrap(line, W + 53))  # as wide as the tables above
+    # the verdict last: the state as a lit badge, then what to do about it
+    v, state = f["verdict"], f["state"]
+    label = state.upper() + (f" {abs(delta):.1f}" if abs(delta) >= 0.5 and state != "on plan" else "")
+    lit = "1;7;33" if state == "over" else "1;7;32"
+    head = tones[v["tone"]](bold(v["head"]))
+    p(" " + (c(lit, f" {label} ") if COLOR else f"[{label}]") + "  " + head)
+    for line in [v["body"], *v["more"]]:
+        out.extend(f"  {part}" for part in wrap(line, T))
 
-    # how old the reading is, so a single run says what a watch footer would
     age = "" if fetched_at is None else "updated now · " if (old := time.time() - fetched_at) < 60 else \
         f"updated {span(timedelta(seconds=old))} ago · "
     card(bold("Claude Code"), dim(f"{clock(now)} · {age}resets {clock(plan.reset)} ({span(plan.reset - now)})"), out)
@@ -812,12 +1133,7 @@ def main() -> None:
     if args.png:
         if args.plain or args.json or args.record or args.watch is not None:
             ap.error("--png can't be combined with --plain, --json, --record or -w")
-        # the coloured card, unboxed: png() draws its own frame
-        COLOR, FRAME = True, False
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            show(args)
-        png(buf.getvalue(), sys.stdout.buffer if args.png == "-" else args.png)
+        show(args)
         return
     if args.watch is None:
         show(args)
@@ -911,7 +1227,11 @@ def show(args: argparse.Namespace) -> float | None:
                    "notes": notes, "speed": speed, "fetch": status, "fetched_at": stamp, "stale": bool(why)}
         print(json.dumps(out, indent=2, default=datetime.isoformat))
         return fetched_at
-    render(a, now, plan, session, notes, speed, fetched_at)
+    f = facts(a, now, plan, session, speed)
+    if args.png:
+        poster(a, now, plan, f, notes, fetched_at, sys.stdout.buffer if args.png == "-" else args.png)
+    else:
+        render(a, now, plan, f, notes, fetched_at)
     return fetched_at
 
 

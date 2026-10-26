@@ -3,39 +3,30 @@
 Am I over or under on Claude Code this week — and what should I do about it tonight?
 
 ```
-Claude Code  Wed 8:00 PM · week resets Sat 12:00 AM (2d 4h)
+Claude Code  Wed 8:00 PM · resets Sat 12:00 AM (2d 4h)
 
-  speed    ◀ slow   on pace   fast ▶                  used  budget  meter target
-  Sat      ░░░░░░░░░███│░░░░░░░░░░░░   0.7× slow        15      20     15     20
-  Sun      ░░░░░░░░████│░░░░░░░░░░░░   0.7× slow        14      20     28     40
-  Mon      ░░░░░░░░░░░░┃██░░░░░░░░░░   1.1× on pace     14      12     42     52
-  Tue      ░░░░░░░░░███│░░░░░░░░░░░░   0.8× slow       9.4      12     51     64
-  Wed      ░░░░░░░░░░░░┃░░░░░░░░░░░░   1.0× on pace     11      11     62     76
-  Thu      ░░░░░░░░░░░░│░░░░░░░░░░░░                     ·      12      ·     88
-  Fri      ░░░░░░░░░░░░│░░░░░░░░░░░░                     ·      12      ·    100
+  week  █████████████████████████░░░┃░░░░░░░░░░░  62%  plan 70%  bed 76%
+        Sat 15/20  Sun 13/20  Mon 14/12  Tue 9/12  Wed 11/12  Thu ·/12  Fri ·/12
 
-  meter                                               used  expect
-  week     ████████████████░┃░░░░░░░   -7.2 under      62%     69%
-  today    ███████████░░░░░░░┃░░░░░░    14% left       11%     18%   of 25%
+  ┌ today ───────────────┐ ┌ speed %/h ────────────────────┐ ┌ time left ───────────┐
+  │ 11 of 25%    14 left │ │ last hour 1.7?       need 3.5 │ │ tonight        4h 0m │
+  │ █████████░░░░░░┃░░░░ │ │ 15m 1.7? · 6h 1.0    plan 1.6 │ │ session            · │
+  │ by now 19    bed 76% │ │ → 95%? at reset               │ │ week           2d 4h │
+  └──────────────────────┘ └───────────────────────────────┘ └──────────────────────┘
 
-  lately                                              used  budget at reset      full
-  last 6h  ░░░░░░░░░░░█┃░░░░░░░░░░░░   0.9× on pace    5.2     5.9     116%   Fri 4PM
-  last 1h  ░░░░░███████│░░░░░░░░░░░░   0.4× slow       0.9     2.1     86%?
-  last 15m ░░░░░███████│░░░░░░░░░░░░   0.4× slow       0.2     0.6     86%?
-
-  today, lately: vs pace to tonight's 76% · days: vs plan
   ? single tick
 
- [UNDER by 7.2%]  on pace   over
-  Go harder. 14% left for tonight over 6.0h (2.3%/h) — 2.1x the planned pace.
+ [UNDER 7.6]  Go harder.
+  Use 14% by midnight — 3.5%/h, 2.2× the planned pace.
 ```
 
 The weekly meter only means something next to where it *should* be by now.
 ccpace reads your live usage, compares it to a plan of how you intend to spend
 the week, and tells you whether to ease off or push. The card reads from the
-bottom up: the verdict sits last, nearest the prompt, with the last few hours,
-the meters and the week's days above it. In a terminal the card is
-boxed and coloured; the sample above is `--plain`.
+bottom up: the verdict sits last, nearest the prompt, with three tiles (today,
+speed, time left) above it and the week at the top. In a terminal the card is
+boxed and coloured; the sample above is `--plain`. `--png` draws a fuller
+version as an image, with the week as a chart (see [Unattended runs](#unattended-runs)).
 
 ## Install
 
@@ -49,7 +40,7 @@ git clone https://github.com/jeffjose/ccpace && ln -s "$PWD/ccpace/ccpace" ~/.lo
 ## Usage
 
 ```
-ccpace              the card: the meter, the plan, the advice, and the speed
+ccpace              the card: the week, today, the speed, and what to do now
 ccpace -f           skip the 60s cache and re-fetch
 ccpace -w 30        redraw every 30s (bare -w: every 60); r re-fetches now, q quits
 ccpace -j           print JSON and exit (scripting / statusline)
@@ -63,22 +54,24 @@ ccpace --used 70 --now 2026-10-07T14:00    what-if, no network
 
 ## Reading the card
 
-**meter** — `week` is the weekly meter, `today` is what you've used since the
-day began out of what it takes to reach tonight's target, `session` is the
-5-hour window. The `┃` struck through a bar is where it was expected to be by
-now; the `expect` column is the same point as a number.
+**week** — the weekly meter. The `┃` struck through the bar is where the plan
+has it by now; `bed` is where the plan has it when today ends. The line under
+it is each day's use out of its share of the week: amber is a day that went
+over, `·` a day still to come.
 
-**speed** — how fast the meter moved over a stretch, as a multiple of what
-that stretch could afford. The centre line is exactly on pace, the right edge
-is 2×. Past days are held to the plan (`budget` is the day's share). Today and
-the `lately` rows are held to the pace that lands tonight's target from where
-the stretch began, so a day spent catching up reads as on pace, not fast.
-`meter` and `target` are where the weekly meter closed each day and where the
-plan had it.
+**today** — what you've used since the day began, out of what it takes to reach
+tonight's target from there (so a day started under plan gets more). `by now`
+is how much of that the plan expected to be gone already.
 
-**lately** — the last 15 minutes, hour and 6 hours, each projected forward:
-`at reset` is where the week ends if the rest of it runs at that multiple of
-the plan, and `full` is when the meter would hit 100%.
+**speed %/h** — how fast the meter moved over the last hour, 15 minutes and 6
+hours, in points per hour. `need` is the rate that lands tonight's target from
+here, and `plan` is the rate the plan itself has for the rest of today: the
+gap between `last hour` and `need` is what to change. The arrow is where the
+week ends if the rest of it runs at the last hour's multiple of the plan, and
+`full` is when the meter would hit 100% at that pace.
+
+**time left** — until the day ends, until the 5-hour session resets (with how
+much of it is used), and until the week resets.
 
 `~` marks a figure interpolated across a gap in the history, and `?` a
 projection that rests on a single tick of the meter (it moves in whole
@@ -199,15 +192,17 @@ insist on a request. Without `--strict` and with no cached reading at all,
 ccpace exits 1 as before.
 
 `--plain` prints the card with no box and no colour regardless of the
-terminal, which is the form to paste or post (about 1,600 characters, against
-roughly 5,000 for the boxed, coloured card).
+terminal, which is the form to paste or post.
 
-`--png FILE` writes the card as an image instead: the same content, in
-colour, about 1500 pixels wide. Nothing is printed. It combines with
-`--strict`, in which case a failed fetch exits before any file is written.
-It needs a monospace font on the machine — DejaVu Sans Mono is looked for
-first (`fonts-dejavu-core` on Debian and Ubuntu). To post it to a Discord
-webhook:
+`--png FILE` writes the card as an image instead, 1800 pixels wide, laid out
+to be read shrunk in a chat feed: the verdict in large type with where the
+meter stands beside it, the three tiles, and the week as a chart of the meter
+against the plan (with the catch-up line to tonight's target and where the
+current pace ends the week) over one bar per day. Nothing is printed. It
+combines with `--strict`, in which case a failed fetch exits before any file
+is written. The type is [Geist](https://vercel.com/font), fetched once from
+jsDelivr into `~/.cache/ccpace/fonts/`; if that can't be reached, DejaVu Sans
+stands in. To post it to a Discord webhook:
 
 ```sh
 ccpace --strict --png card.png && curl -F "file1=@card.png" "$DISCORD_WEBHOOK_URL"
