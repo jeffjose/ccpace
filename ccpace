@@ -1026,7 +1026,7 @@ def render(a: dict, now: datetime, plan: Plan, f: dict, notes: list[str], fetche
       + dim(f"  plan {exp:.0f}%  bed {a['bedtime_target']:.0f}%"))
     cells = []
     for d in f["days"]:
-        n = "·" if d["used"] is None else ("~" if d["rough"] else "") + (pct(d["used"]) if d["used"] < 1 else f"{d['used']:.0f}")
+        n = "·" if d["used"] is None else ("~" if d["rough"] else "") + (pct(d["used"]) if 0 < d["used"] < 1 else f"{d['used']:.0f}")
         cell = f"{d['label']} {n}/{d['share']:.0f}"
         cells.append(yellow(cell) if d["over"] else bold(cell) if d["today"] else
                      dim(cell) if d["used"] is None else cell)
