@@ -940,8 +940,9 @@ def poster(a: dict, now: datetime, plan: Plan, f: dict, notes: list[str], fetche
     for ny, s, hue in names:
         text(X1 + 14, ny + 6, s, 16, 600, hue)
 
-    # one bar per day under its stretch of the chart: a track up to its share, a dashed line at the share,
-    # filled by what it used, and for today a tick where the plan says it should be by now
+    # one bar per day under its stretch of the chart: a dashed box the size of its share, filling up
+    # with what it used (drawn over the fill, so a day that went over still shows where its share ended),
+    # and for today a tick where the plan says it should be by now
     base, tallest = oy + 470, max([1.0, *(max(d["share"], d["used"] or 0) for d in days)])
     k = 160 / tallest
     stroke([(X0, base), (X1, base)], RULE, 2)
@@ -950,11 +951,10 @@ def poster(a: dict, now: datetime, plan: Plan, f: dict, notes: list[str], fetche
         if bw_ <= 4:
             continue
         top = base - d["share"] * k
-        box(bx, top, bw_, d["share"] * k, TRACK, 6)
         hue = WARN if d["over"] else GOOD
         if d["used"] is not None:
-            box(bx, base - d["used"] * k, bw_, d["used"] * k, hue, 6)
-        stroke([(bx - 4, top), (bx + bw_ + 4, top)], SOFT, 2.5, (7, 5))
+            box(bx + 5, base - d["used"] * k, bw_ - 10, d["used"] * k, hue, 5)
+        stroke([(bx, base), (bx, top), (bx + bw_, top), (bx + bw_, base)], SOFT, 2.5, (7, 5))
         if d["today"]:
             due = min(max(exp - plan.at(d["from"]), 0), d["share"])
             box(bx - 6, base - due * k - 1.5, bw_ + 12, 3, INK)
@@ -967,7 +967,7 @@ def poster(a: dict, now: datetime, plan: Plan, f: dict, notes: list[str], fetche
     lx, ly = X1 + 14, base - 110
     box(lx, ly, 18, 18, GOOD, 4)
     text(lx + 26, ly + 15, "used", 15, 400, SOFT)
-    stroke([(lx - 2, ly + 40), (lx + 20, ly + 40)], SOFT, 2.5, (5, 4))
+    stroke([(lx, ly + 50), (lx, ly + 32), (lx + 18, ly + 32), (lx + 18, ly + 50)], SOFT, 2, (4, 3))
     text(lx + 26, ly + 46, "day's share", 15, 400, SOFT)
     box(lx - 2, ly + 70, 22, 3, INK)
     text(lx + 26, ly + 77, "plan by now", 15, 400, SOFT)
