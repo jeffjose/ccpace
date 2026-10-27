@@ -558,6 +558,8 @@ def facts(a: dict, now: datetime, plan: Plan, session: dict | None, speed: list[
         "verdict": verdict(a),
         "state": "on plan" if abs(a["delta"]) <= TOLERANCE else "over" if a["delta"] > 0 else "under",
         "block": "tonight" if a["evening"] else "today",
+        # how hard to go, as a multiple of the planned pace: 0× once today's target is reached
+        "mult": 0.0 if a["room_today"] <= 0 else a["multiplier"],
         "need": need, "planned": planned, "lately": lately,
         "pace": pace and {"ends": pace["ends"], "full_at": pace.get("full_at"), "thin": pace["thin"],
                           "per_plan": pace["used"] / pace["planned"]},
@@ -772,7 +774,7 @@ def poster(a: dict, now: datetime, plan: Plan, f: dict, notes: list[str], fetche
         text(left_x + 32, top + 64 + 18 + 35 * len(body) + 22 + 28 * i, ln, 20, 400, MUTED)
     sx, sy = W - P - 32 - side, y + 28 + (tall - 160) / 2
     word = {"under": "under plan", "over": "over plan", "on plan": "on plan"}[state]
-    runs(sx, sy + 46, [(f"{abs(delta):.1f}", 52, 600, INK), (f"  {word}", 24, 400, SOFT)])
+    runs(sx, sy + 46, [(f"{used:.0f}%", 52, 600, INK), (f"  of {exp:.0f}%", 28, 400, SOFT)])
     box(sx, sy + 70, side, 12, TRACK, 6)
     span_ = 15.0  # the scale runs ±15 points; the middle band is the tolerance
     box(sx + side * (0.5 - TOLERANCE / span_ / 2), sy + 70, side * TOLERANCE / span_, 12, RULE)
@@ -781,7 +783,8 @@ def poster(a: dict, now: datetime, plan: Plan, f: dict, notes: list[str], fetche
     for name, at, anchor in (("under", 0, "ls"), ("on plan", 0.5, "ms"), ("over", 1, "rs")):
         lit = name == state
         text(sx + side * at, sy + 112, name, 16, 600 if lit else 400, mark if lit else MUTED, anchor)
-    text(sx, sy + 146, f"{used:.0f}% used · plan says {exp:.0f}%", 18, 400, MUTED)
+    runs(sx, sy + 146, [(f"{abs(delta):.1f} {word}" if state != "on plan" else "on plan", 20, 600, mark),
+                        (" · used / plan now", 18, 400, MUTED)])
     y += tall + 56 + 22
 
     # three tiles: today's allowance, the speed in %/h, and the clocks
@@ -818,10 +821,12 @@ def poster(a: dict, now: datetime, plan: Plan, f: dict, notes: list[str], fetche
     rate = {d["name"]: d for d in f["lately"]}
     hour = rate.get("1h", {"rate": 0.0, "rough": False, "thin": False})
     need, planned = f["need"], f["planned"]
-    parts = [(f"{hour['rate']:.1f}", 44, 700, INK), ("%/h", 24, 400, MUTED)]
-    if need is not None:
-        parts.append((f"  → {need:.1f}", 24, 600, BLUE))
-    runs(x, y + 98, parts)
+    mult = f["mult"]
+    if mult is not None:
+        runs(x, y + 98, [(f"{mult:.1f}×" if mult else "0×", 44, 700, BLUE if v["tone"] == "go" else tone),
+                         ("  the planned pace", 20, 400, MUTED)])
+    else:
+        runs(x, y + 98, [(f"{hour['rate']:.1f}", 44, 700, INK), ("%/h", 24, 400, MUTED)])
     top_rate = max([5.0, *(d["rate"] for d in f["lately"]), need or 0, planned or 0]) * 1.1
     px = lambda r: x + bw * min(r / top_rate, 1)  # noqa: E731
     text(x, y + 116, "0", 13, 400, FAINT)
@@ -845,8 +850,9 @@ def poster(a: dict, now: datetime, plan: Plan, f: dict, notes: list[str], fetche
             marks[i] = (marks[i - 1][0] + 38, *marks[i][1:])
     for mx, name, hue in marks:
         text(min(mx, x + bw - 12), y + 168, name, 13, 500, hue, "ms")
-    text(x, y + 196, " · ".join(f"{n} {('~' if d['rough'] else '')}{d['rate']:.1f}{'?' if d['thin'] else ''}"
-                                for n, d in rate.items()), 17, 400, MUTED)
+    runs(x, y + 196, [(" · ".join(f"{n} {('~' if d['rough'] else '')}{d['rate']:.1f}{'?' if d['thin'] else ''}"
+                                  for n, d in rate.items()), 17, 400, MUTED),
+                      *([(f"  need {need:.1f}", 17, 600, BLUE)] if need is not None else [])])
     if f["pace"]:
         ends = f["pace"]["ends"]
         hue = BAD if ends > 100 + TOLERANCE else WARN if ends < 100 - TOLERANCE else GOOD
@@ -1100,7 +1106,8 @@ def render(a: dict, now: datetime, plan: Plan, f: dict, notes: list[str], fetche
     label = state.upper() + (f" {abs(delta):.1f}" if abs(delta) >= 0.5 and state != "on plan" else "")
     lit = "1;7;33" if state == "over" else "1;7;32"
     head = tones[v["tone"]](bold(v["head"]))
-    p(" " + (c(lit, f" {label} ") if COLOR else f"[{label}]") + "  " + head)
+    gist = ([f"{f['mult']:.1f}× pace" if f["mult"] else "0× pace"] if f["mult"] is not None else []) + [f"{used:.0f}% of {exp:.0f}%"]
+    p(" " + (c(lit, f" {label} ") if COLOR else f"[{label}]") + "  " + head + "  " + dim(" · ".join(gist)))
     for line in [v["body"], *v["more"]]:
         out.extend(f"  {part}" for part in wrap(line, T))
 
