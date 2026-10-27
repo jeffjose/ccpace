@@ -9,14 +9,14 @@ Claude Code  Wed 8:00 PM · resets Sat 12:00 AM (2d 4h)
         Sat 15/20  Sun 13/20  Mon 14/12  Tue 9/12  Wed 11/12  Thu ·/12  Fri ·/12
 
   ┌ today ───────────────┐ ┌ speed %/h ────────────────────┐ ┌ time left ───────────┐
-  │ 11 of 25%    14 left │ │ last hour 1.7?       need 3.5 │ │ tonight        4h 0m │
+  │ 11 of 25%    14 left │ │ last hour 1.7?     target 3.5 │ │ tonight        4h 0m │
   │ █████████░░░░░░┃░░░░ │ │ 15m 1.7? · 6h 1.0    plan 1.6 │ │ session            · │
   │ by now 19    bed 76% │ │ → 95%? at reset               │ │ week           2d 4h │
   └──────────────────────┘ └───────────────────────────────┘ └──────────────────────┘
 
   ? single tick
 
- [UNDER 7.6]  Go harder.
+ [UNDER 7.6]  Go harder.  2.2× pace · 62% of 70%
   Use 14% by midnight — 3.5%/h, 2.2× the planned pace.
 ```
 
@@ -64,9 +64,9 @@ tonight's target from there (so a day started under plan gets more). `by now`
 is how much of that the plan expected to be gone already.
 
 **speed %/h** — how fast the meter moved over the last hour, 15 minutes and 6
-hours, in points per hour. `need` is the rate that lands tonight's target from
+hours, in points per hour. `target` is the rate that lands tonight's target from
 here, and `plan` is the rate the plan itself has for the rest of today: the
-gap between `last hour` and `need` is what to change. The arrow is where the
+gap between `last hour` and `target` is what to change. The arrow is where the
 week ends if the rest of it runs at the last hour's multiple of the plan, and
 `full` is when the meter would hit 100% at that pace.
 

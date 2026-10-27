@@ -484,13 +484,8 @@ def verdict(a: dict) -> dict:
 
     if room <= 0:
         past = f"already {-room:.0f}% past" if room <= -0.5 else "right at"
-        more = []
-        if not a["week_over"]:
-            left = a["tomorrow_target"] - a["used"]
-            more.append(f"Anything more comes out of tomorrow, which is down to {max(left, 0):.0f}% "
-                        f"(normally {a['tomorrow_nominal']:.0f}%).")
         return {"tone": "stop", "head": "Stop for today.",
-                "body": f"You're {past} {block}'s bedtime target ({a['bedtime_target']:.0f}%).", "more": more}
+                "body": f"You're {past} {block}'s bedtime target ({a['bedtime_target']:.0f}%).", "more": []}
 
     x = f"{mult:.1f}×" if mult is not None else "—"
     if a["in_prime"]:
@@ -835,7 +830,7 @@ def poster(a: dict, now: datetime, plan: Plan, f: dict, notes: list[str], fetche
     marks = []
     if need is not None:
         box(px(need) - bw * 0.03, y + 131, bw * 0.06, 18, BLUE_DEEP, 4)
-        marks.append((px(need), "need", BLUE))
+        marks.append((px(need), "target", BLUE))
     if planned:
         box(px(planned) - 1, y + 128, 2, 24, MUTED)
         marks.append((px(planned), "plan", MUTED))
@@ -852,7 +847,7 @@ def poster(a: dict, now: datetime, plan: Plan, f: dict, notes: list[str], fetche
         text(min(mx, x + bw - 12), y + 168, name, 13, 500, hue, "ms")
     runs(x, y + 196, [(" · ".join(f"{n} {('~' if d['rough'] else '')}{d['rate']:.1f}{'?' if d['thin'] else ''}"
                                   for n, d in rate.items()), 17, 400, MUTED),
-                      *([(f"  need {need:.1f}", 17, 600, BLUE)] if need is not None else [])])
+                      *([(f"  target {need:.1f}", 17, 600, BLUE)] if need is not None else [])])
     if f["pace"]:
         ends = f["pace"]["ends"]
         hue = BAD if ends > 100 + TOLERANCE else WARN if ends < 100 - TOLERANCE else GOOD
@@ -1073,7 +1068,7 @@ def render(a: dict, now: datetime, plan: Plan, f: dict, notes: list[str], fetche
         hot = ends > 100 + TOLERANCE
         fast = [(red if hot else green)(f"→ {min(ends, 999):.0f}%{unsure}")
                 + dim(f" full {moment(f['pace']['full_at'], now)}" if hot and f["pace"]["full_at"] else " at reset")]
-    speed = [spread(f"last hour {bold(r('1h'))}", f"need {bold(c('36', need))}", WIDE[1]),
+    speed = [spread(f"last hour {bold(r('1h'))}", f"target {bold(c('36', need))}", WIDE[1]),
              spread(dim(f"15m {r('15m')} · 6h {r('6h')}"), dim(f"plan {f['planned'] or 0:.1f}"), WIDE[1]),
              *(fast or [dim("no pace to project")])]
 
