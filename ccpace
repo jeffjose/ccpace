@@ -870,7 +870,7 @@ def poster(a: dict, now: datetime, plan: Plan, f: dict, notes: list[str], fetche
     y += th + 22
 
     # the week: the meter against the plan, and each day against its share
-    box(left_x, y, inner, 560, PANEL, 14)
+    box(left_x, y, inner, 600, PANEL, 14)
     runs(left_x + 24, y + 34, [("THE WEEK", 16, 600, MUTED),
                                ("   meter vs plan · bars: what each day used vs its share", 16, 400, MUTED)])
     ox, oy = left_x + 24, y + 50
@@ -939,32 +939,38 @@ def poster(a: dict, now: datetime, plan: Plan, f: dict, notes: list[str], fetche
     for ny, s, hue in names:
         text(X1 + 14, ny + 6, s, 16, 600, hue)
 
-    # one bar per day under its stretch of the chart: a dashed outline for its share, filled by what it used
-    base, tallest = oy + 430, max([1.0, *(max(d["share"], d["used"] or 0) for d in days)])
-    k = 110 / tallest
+    # one bar per day under its stretch of the chart: a track up to its share, a dashed line at the share,
+    # filled by what it used, and for today a tick where the plan says it should be by now
+    base, tallest = oy + 470, max([1.0, *(max(d["share"], d["used"] or 0) for d in days)])
+    k = 160 / tallest
     stroke([(X0, base), (X1, base)], RULE, 2)
     for d, lo, hi in zip(days, bounds, bounds[1:]):
         bx, bw_ = X(lo) + 10, X(hi) - X(lo) - 20
         if bw_ <= 4:
             continue
         top = base - d["share"] * k
-        for edge in ([(bx, base), (bx, top), (bx + bw_, top), (bx + bw_, base)],):
-            stroke(edge, "#4a5361", 2.5, (7, 5))
+        box(bx, top, bw_, d["share"] * k, TRACK, 6)
         hue = WARN if d["over"] else GOOD
         if d["used"] is not None:
             box(bx, base - d["used"] * k, bw_, d["used"] * k, hue, 6)
-            text(bx + bw_ / 2, base - max(d["used"], d["share"]) * k - 10,
-                 f"{'~' if d['rough'] else ''}{d['used']:.0f}", 20, 700, hue, "ms")
+        stroke([(bx - 4, top), (bx + bw_ + 4, top)], SOFT, 2.5, (7, 5))
+        if d["today"]:
+            due = min(max(exp - plan.at(d["from"]), 0), d["share"])
+            box(bx - 6, base - due * k - 1.5, bw_ + 12, 3, INK)
+        n = f"{'~' if d['rough'] else ''}{d['used']:.0f}" if d["used"] is not None else "·"
+        runs(bx + bw_ / 2, base - max(d["used"] or 0, d["share"]) * k - 12,
+             [(n, 20, 700, hue if d["used"] is not None else FAINT), (f"/{d['share']:.0f}", 17, 500, MUTED)], "center")
         mid = (X(lo) + X(hi)) / 2
-        text(mid, oy + 458, d["label"], 17 if d["today"] else 16, 700 if d["today"] else 500,
+        text(mid, base + 30, d["label"], 17 if d["today"] else 16, 700 if d["today"] else 500,
              INK if d["today"] else FAINT if d["used"] is None else SOFT, "ms")
-        text(mid, oy + 480, f"of {d['share']:.0f}", 15, 400, MUTED, "ms")
-    box(X1 + 14, oy + 348, 18, 18, GOOD, 4)
-    text(X1 + 40, oy + 363, "used", 15, 400, SOFT)
-    stroke([(X1 + 14, oy + 380), (X1 + 32, oy + 380), (X1 + 32, oy + 398), (X1 + 14, oy + 398), (X1 + 14, oy + 380)],
-           "#4a5361", 2, (4, 3))
-    text(X1 + 40, oy + 395, "day's share", 15, 400, SOFT)
-    y += 560
+    lx, ly = X1 + 14, base - 110
+    box(lx, ly, 18, 18, GOOD, 4)
+    text(lx + 26, ly + 15, "used", 15, 400, SOFT)
+    stroke([(lx - 2, ly + 40), (lx + 20, ly + 40)], SOFT, 2.5, (5, 4))
+    text(lx + 26, ly + 46, "day's share", 15, 400, SOFT)
+    box(lx - 2, ly + 70, 22, 3, INK)
+    text(lx + 26, ly + 77, "plan by now", 15, 400, SOFT)
+    y += 600
 
     # the small print, only when there is some
     small = [text_ for on, text_ in (
